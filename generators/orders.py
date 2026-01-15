@@ -32,7 +32,6 @@ class Order:
     order_id: str
     customer_id: str
     store_id: str
-    driver_id: str | None
     status: OrderStatus
     subtotal: float
     tax: float
@@ -140,7 +139,7 @@ class OrderGenerator(BaseGenerator):
     
     def _calculate_tip(self, subtotal: float, status: OrderStatus) -> float:
         """Generate realistic tip based on subtotal."""
-        if status == OrderStatus.CANCELLED:
+        if status == OrderStatus.CANCELED:
             return 0.0
         tip_pct = random.choices(
             [0, 0.10, 0.15, 0.18, 0.20, 0.25],
@@ -228,9 +227,12 @@ class OrderGenerator(BaseGenerator):
         tax = round(subtotal * self.TAX_RATE, 2)
         created_at = self._generate_order_time()
         
+        # For live generation: new orders start as 'pending' or 'confirmed'
+        # Bundling service will process them and update status
+        # For batch generation with historical data: use weighted random
         status = random.choices(
-            list(OrderStatus),
-            weights=[0.02, 0.03, 0.02, 0.03, 0.85, 0.05]
+            [OrderStatus.PENDING, OrderStatus.CONFIRMED],
+            weights=[0.3, 0.7]
         )[0]
         
         tip = self._calculate_tip(subtotal, status)
@@ -239,23 +241,14 @@ class OrderGenerator(BaseGenerator):
         confirmed_at = None
         picked_at = None
         delivered_at = None
-        driver_id = None
         
-        if status != OrderStatus.PENDING:
+        if status == OrderStatus.CONFIRMED:
             confirmed_at = created_at + timedelta(minutes=random.randint(1, 5))
-            driver_id = random.choice(self._driver_ids)
-        
-        if status in [OrderStatus.PICKING, OrderStatus.OUT_FOR_DELIVERY, OrderStatus.DELIVERED]:
-            picked_at = confirmed_at + timedelta(minutes=random.randint(10, 30))
-        
-        if status == OrderStatus.DELIVERED:
-            delivered_at = picked_at + timedelta(minutes=random.randint(15, 45))
         
         order = Order(
             order_id=order_id,
             customer_id=customer_id,
             store_id=store_id,
-            driver_id=driver_id,
             status=status,
             subtotal=subtotal,
             tax=tax,
@@ -295,13 +288,13 @@ class OrderGenerator(BaseGenerator):
             cursor.executemany(
                 """
                 INSERT INTO orders 
-                (order_id, customer_id, store_id, driver_id, status, subtotal, tax,
+                (order_id, customer_id, store_id, status, subtotal, tax,
                  delivery_fee, tip, total, created_at, confirmed_at, picked_at,
                  delivered_at, delivery_latitude, delivery_longitude, delivery_notes)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 [
-                    (o.order_id, o.customer_id, o.store_id, o.driver_id, o.status.value,
+                    (o.order_id, o.customer_id, o.store_id, o.status.value,
                      o.subtotal, o.tax, o.delivery_fee, o.tip, o.total,
                      o.created_at.isoformat(),
                      o.confirmed_at.isoformat() if o.confirmed_at else None,

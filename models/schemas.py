@@ -10,7 +10,7 @@ class OrderStatus(str, Enum):
     PICKING = "picking"
     OUT_FOR_DELIVERY = "out_for_delivery"
     DELIVERED = "delivered"
-    CANCELLED = "cancelled"
+    CANCELED = "canceled"
 
 
 class ProductCategory(str, Enum):
