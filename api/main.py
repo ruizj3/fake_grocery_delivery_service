@@ -38,6 +38,7 @@ class AppState:
     def __init__(self):
         self.order_generation_active = False
         self.bundle_processing_active = False
+        self.delivery_simulation_active = False
         self.customer_generation_active = False
         self.driver_generation_active = False
         self.store_generation_active = False
@@ -52,6 +53,7 @@ class AppState:
         # Background tasks
         self.order_task: asyncio.Task | None = None
         self.bundle_task: asyncio.Task | None = None
+        self.delivery_task: asyncio.Task | None = None
         self.customer_task: asyncio.Task | None = None
         self.driver_task: asyncio.Task | None = None
         self.store_task: asyncio.Task | None = None
@@ -97,7 +99,11 @@ class AppState:
     @property
     def bundle_service(self):
         if not self._bundle_service:
-            self._bundle_service = BundlingService()
+            self._bundle_service = BundlingService(
+                time_window_minutes=60,  # Increased from 30 to allow more bundling
+                max_bundle_size=10,
+                max_radius_km=10.0,  # Increased from 5.0 to bundle wider area
+            )
         return self._bundle_service
 
 
@@ -136,14 +142,15 @@ async def periodic_bundle_processor():
                     bundles = state.bundle_service.assign_drivers(bundles)
                     state.bundle_service.save_bundles_to_db(bundles)
                     
-                    # Mark orders as "picking" (in progress)
+                    # Mark orders as "picking" with picked_at timestamp
                     from db import get_cursor
                     with get_cursor() as cursor:
                         for bundle in bundles:
+                            picked_time = datetime.now()
                             for stop in bundle.stops:
                                 cursor.execute(
-                                    "UPDATE orders SET status = 'picking', driver_id = ? WHERE order_id = ?",
-                                    (bundle.driver_id, stop.order_id)
+                                    "UPDATE orders SET status = 'picking', picked_at = ? WHERE order_id = ?",
+                                    (picked_time.isoformat(), stop.order_id)
                                 )
                     
                     stats = state.bundle_service.get_bundle_stats(bundles)
@@ -152,6 +159,92 @@ async def periodic_bundle_processor():
                     print(f"[{datetime.now().strftime('%H:%M:%S')}] No pending orders to bundle")
         except Exception as e:
             print(f"Error processing bundles: {e}")
+            await asyncio.sleep(10)
+
+
+async def delivery_simulator():
+    """Background task: simulates order delivery progression with realistic timestamps."""
+    from db import get_cursor
+    
+    while state.delivery_simulation_active:
+        try:
+            await asyncio.sleep(10)  # Check every 10 seconds
+            
+            if not state.delivery_simulation_active:
+                break
+            
+            with get_cursor() as cursor:
+                # Find bundles with orders in 'picking' status
+                cursor.execute("""
+                    SELECT DISTINCT b.bundle_id, b.estimated_duration_min, b.total_distance_km
+                    FROM bundles b
+                    JOIN bundle_stops bs ON b.bundle_id = bs.bundle_id
+                    JOIN orders o ON bs.order_id = o.order_id
+                    WHERE o.status = 'picking'
+                    AND o.picked_at IS NOT NULL
+                    AND datetime(o.picked_at, '+10 minutes') < datetime('now')
+                """)
+                picking_bundles = cursor.fetchall()
+                
+                # Progress picking → out_for_delivery
+                for bundle_id, est_duration, total_distance in picking_bundles:
+                    cursor.execute("""
+                        UPDATE orders
+                        SET status = 'out_for_delivery'
+                        WHERE order_id IN (
+                            SELECT order_id FROM bundle_stops WHERE bundle_id = ?
+                        )
+                    """, (bundle_id,))
+                    print(f"[{datetime.now().strftime('%H:%M:%S')}] Bundle {bundle_id[:8]}... out for delivery")
+                
+                # Find bundles with orders in 'out_for_delivery' status for sequential delivery
+                cursor.execute("""
+                    SELECT DISTINCT b.bundle_id, b.estimated_duration_min
+                    FROM bundles b
+                    JOIN bundle_stops bs ON b.bundle_id = bs.bundle_id
+                    JOIN orders o ON bs.order_id = o.order_id
+                    WHERE o.status = 'out_for_delivery'
+                    AND o.picked_at IS NOT NULL
+                    AND datetime(o.picked_at, '+20 minutes') < datetime('now')
+                """)
+                delivery_bundles = cursor.fetchall()
+                
+                # Deliver orders sequentially within each bundle
+                for bundle_id, est_duration in delivery_bundles:
+                    # Get ordered stops for this bundle
+                    cursor.execute("""
+                        SELECT bs.order_id, bs.stop_sequence, o.picked_at
+                        FROM bundle_stops bs
+                        JOIN orders o ON bs.order_id = o.order_id
+                        WHERE bs.bundle_id = ?
+                        AND o.status = 'out_for_delivery'
+                        ORDER BY bs.stop_sequence
+                    """, (bundle_id,))
+                    stops = cursor.fetchall()
+                    
+                    if stops:
+                        # Calculate time between stops based on total duration
+                        time_per_stop = (est_duration or 30) / max(len(stops), 1)
+                        
+                        for order_id, sequence, picked_at in stops:
+                            # Each stop gets delivered at incremental times
+                            from datetime import timedelta
+                            picked_dt = datetime.fromisoformat(picked_at)
+                            # Base delay (20 min to start delivery) + sequence-based increments
+                            delivery_delay = timedelta(minutes=20 + (sequence * time_per_stop))
+                            delivered_at = picked_dt + delivery_delay
+                            
+                            # Only mark as delivered if enough time has passed
+                            if datetime.now() >= delivered_at:
+                                cursor.execute("""
+                                    UPDATE orders
+                                    SET status = 'delivered', delivered_at = ?
+                                    WHERE order_id = ?
+                                """, (delivered_at.isoformat(), order_id))
+                                print(f"[{datetime.now().strftime('%H:%M:%S')}] Delivered order {order_id[:8]}... (stop {sequence + 1})")
+                
+        except Exception as e:
+            print(f"Error in delivery simulation: {e}")
             await asyncio.sleep(10)
 
 
@@ -317,6 +410,7 @@ async def get_service_status():
     return ServiceStatus(
         order_generation_active=state.order_generation_active,
         bundle_processing_active=state.bundle_processing_active,
+        delivery_simulation_active=state.delivery_simulation_active,
         customer_generation_active=state.customer_generation_active,
         driver_generation_active=state.driver_generation_active,
         store_generation_active=state.store_generation_active,
@@ -936,6 +1030,13 @@ async def start_all_services(background_tasks: BackgroundTasks):
     else:
         results["bundles"] = "already_running"
     
+    if not state.delivery_simulation_active:
+        state.delivery_simulation_active = True
+        state.delivery_task = asyncio.create_task(delivery_simulator())
+        results["delivery_simulation"] = "started"
+    else:
+        results["delivery_simulation"] = "already_running"
+    
     if not state.customer_generation_active:
         state.customer_generation_active = True
         state.customer_task = asyncio.create_task(random_customer_generator())
@@ -965,17 +1066,19 @@ async def stop_all_services():
     """Stop all background services."""
     state.order_generation_active = False
     state.bundle_processing_active = False
+    state.delivery_simulation_active = False
     state.customer_generation_active = False
     state.driver_generation_active = False
     state.store_generation_active = False
     
-    for task in [state.order_task, state.bundle_task, state.customer_task,
-                 state.driver_task, state.store_task]:
+    for task in [state.order_task, state.bundle_task, state.delivery_task,
+                 state.customer_task, state.driver_task, state.store_task]:
         if task:
             task.cancel()
     
     state.order_task = None
     state.bundle_task = None
+    state.delivery_task = None
     state.customer_task = None
     state.driver_task = None
     state.store_task = None

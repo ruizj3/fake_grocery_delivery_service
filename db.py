@@ -135,7 +135,6 @@ def init_database(reset: bool = False):
             order_id TEXT PRIMARY KEY,
             customer_id TEXT NOT NULL,
             store_id TEXT,
-            driver_id TEXT,
             status TEXT NOT NULL,
             subtotal REAL NOT NULL,
             tax REAL NOT NULL,
@@ -150,8 +149,7 @@ def init_database(reset: bool = False):
             delivery_longitude REAL NOT NULL,
             delivery_notes TEXT,
             FOREIGN KEY (customer_id) REFERENCES customers(customer_id),
-            FOREIGN KEY (store_id) REFERENCES stores(store_id),
-            FOREIGN KEY (driver_id) REFERENCES drivers(driver_id)
+            FOREIGN KEY (store_id) REFERENCES stores(store_id)
         )
     """)
     
@@ -176,7 +174,6 @@ def init_database(reset: bool = False):
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_stores_active ON stores(is_active)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_orders_customer ON orders(customer_id)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_orders_store ON orders(store_id)")
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_orders_driver ON orders(driver_id)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_orders_created ON orders(created_at)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_order_items_order ON order_items(order_id)")

@@ -37,6 +37,7 @@ class StatsResponse(BaseModel):
 class ServiceStatus(BaseModel):
     order_generation_active: bool
     bundle_processing_active: bool
+    delivery_simulation_active: bool
     customer_generation_active: bool
     driver_generation_active: bool
     store_generation_active: bool
