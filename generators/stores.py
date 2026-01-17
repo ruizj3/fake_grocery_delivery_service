@@ -1,8 +1,10 @@
 import uuid
 import random
+import math
 from datetime import datetime, timedelta
 from dataclasses import dataclass
 from .base import BaseGenerator
+from .geofence import get_all_zones, get_zone_weights
 from db import get_cursor
 
 
@@ -35,14 +37,7 @@ class StoreGenerator(BaseGenerator):
         "Provisions", "Pantry", "Basket", "Cart", "Goods", "Fare",
     ]
     
-    # Metro areas for store locations (same as customers but stores are more central)
-    METRO_CENTERS = [
-        {"city": "San Francisco", "state": "CA", "lat": 37.7749, "lon": -122.4194, "weight": 0.30},
-        {"city": "Oakland", "state": "CA", "lat": 37.8044, "lon": -122.2712, "weight": 0.20},
-        {"city": "San Jose", "state": "CA", "lat": 37.3382, "lon": -121.8863, "weight": 0.25},
-        {"city": "Berkeley", "state": "CA", "lat": 37.8716, "lon": -122.2727, "weight": 0.10},
-        {"city": "Palo Alto", "state": "CA", "lat": 37.4419, "lon": -122.1430, "weight": 0.15},
-    ]
+    # Delivery zones are defined in geofence.py
     
     OPERATING_HOURS = [
         ("06:00", "22:00"),  # Standard
@@ -55,6 +50,7 @@ class StoreGenerator(BaseGenerator):
     def __init__(self, seed: int | None = 42):
         super().__init__(seed)
         self._used_names = set()
+        self.delivery_zones = get_all_zones()
     
     def _generate_unique_name(self) -> str:
         """Generate a unique store name."""
@@ -81,14 +77,20 @@ class StoreGenerator(BaseGenerator):
         return f"{number} {random.choice(street_names)}"
     
     def generate_one(self) -> Store:
-        # Weighted metro selection
-        metros = self.METRO_CENTERS
-        weights = [m["weight"] for m in metros]
-        metro = random.choices(metros, weights=weights)[0]
+        # Select zone based on weights
+        zone = random.choices(self.delivery_zones, weights=get_zone_weights())[0]
         
-        # Stores cluster tighter than customers (commercial areas)
-        lat = metro["lat"] + random.uniform(-0.03, 0.03)
-        lon = metro["lon"] + random.uniform(-0.03, 0.03)
+        # Stores are more centrally located (within 60% of zone radius)
+        # Use polar coordinates for uniform distribution
+        r = zone["radius_km"] * 0.6 * math.sqrt(random.random())
+        theta = random.uniform(0, 2 * math.pi)
+        
+        # Convert to lat/lon offset
+        lat_offset = (r * math.cos(theta)) / 111.0
+        lon_offset = (r * math.sin(theta)) / (111.0 * math.cos(math.radians(zone["lat"])))
+        
+        lat = zone["lat"] + lat_offset
+        lon = zone["lon"] + lon_offset
         
         # Operating hours
         opens, closes = random.choice(self.OPERATING_HOURS)
@@ -101,9 +103,9 @@ class StoreGenerator(BaseGenerator):
             store_id=str(uuid.uuid4()),
             name=self._generate_unique_name(),
             address=self._generate_address(),
-            city=metro["city"],
-            state=metro["state"],
-            zip_code=self.fake.zipcode_in_state(metro["state"]),
+            city=zone["city"],
+            state=zone["state"],
+            zip_code=self.fake.zipcode_in_state(zone["state"]),
             latitude=lat,
             longitude=lon,
             opens_at=opens,

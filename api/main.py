@@ -23,6 +23,7 @@ from generators import (
     OrderGenerator,
 )
 from services import BundlingService
+from services.predictions import PredictionService
 from api.models import (
     GenerationResponse,
     OrderResponse,
@@ -30,6 +31,7 @@ from api.models import (
     StatsResponse,
     ConfigUpdate,
     ServiceStatus,
+    PredictionResponse,
 )
 
 
@@ -42,6 +44,7 @@ class AppState:
         self.customer_generation_active = False
         self.driver_generation_active = False
         self.store_generation_active = False
+        self.prediction_sending_active = False
         
         # Generation intervals
         self.order_interval_seconds = 10.0  # New order every N seconds
@@ -49,14 +52,17 @@ class AppState:
         self.customer_interval_seconds = 120.0  # New customers every N seconds
         self.driver_interval_seconds = 300.0  # New drivers every N seconds
         self.store_interval_seconds = 600.0  # New stores every N seconds
+        self.prediction_interval_seconds = 10.0  # Send predictions every N seconds
         
         # Background tasks
         self.order_task: asyncio.Task | None = None
         self.bundle_task: asyncio.Task | None = None
         self.delivery_task: asyncio.Task | None = None
+        self.cancellation_task: asyncio.Task | None = None
         self.customer_task: asyncio.Task | None = None
         self.driver_task: asyncio.Task | None = None
         self.store_task: asyncio.Task | None = None
+        self.prediction_task: asyncio.Task | None = None
         
         # Generators (lazy init after DB ready)
         self._customer_gen = None
@@ -105,6 +111,10 @@ class AppState:
                 max_radius_km=10.0,  # Increased from 5.0 to bundle wider area
             )
         return self._bundle_service
+    
+    @property
+    def prediction_service(self):
+        return PredictionService()
 
 
 state = AppState()
@@ -143,10 +153,23 @@ async def periodic_bundle_processor():
                     state.bundle_service.save_bundles_to_db(bundles)
                     
                     # Mark orders as "picking" with picked_at timestamp
+                    # Also set assigned_at for bundles with drivers
                     from db import get_cursor
+                    from datetime import timedelta
+                    import random
                     with get_cursor() as cursor:
                         for bundle in bundles:
-                            picked_time = datetime.now()
+                            # Set assigned_at based on bundle.created_at (driver assigned right after bundle creation)
+                            if bundle.driver_id:
+                                # Assigned 0-2 minutes after bundle creation
+                                assigned_time = bundle.created_at + timedelta(minutes=random.randint(0, 2))
+                                cursor.execute(
+                                    "UPDATE bundles SET assigned_at = ? WHERE bundle_id = ?",
+                                    (assigned_time.isoformat(), bundle.bundle_id)
+                                )
+                            
+                            # Picking starts 5-15 minutes after bundle creation (and after assignment)
+                            picked_time = bundle.created_at + timedelta(minutes=random.randint(5, 15))
                             for stop in bundle.stops:
                                 cursor.execute(
                                     "UPDATE orders SET status = 'picking', picked_at = ? WHERE order_id = ?",
@@ -188,13 +211,29 @@ async def delivery_simulator():
                 
                 # Progress picking → out_for_delivery
                 for bundle_id, est_duration, total_distance in picking_bundles:
+                    # Mark picking as completed - calculate relative to picked_at to ensure chronological order
                     cursor.execute("""
                         UPDATE orders
-                        SET status = 'out_for_delivery'
+                        SET status = 'out_for_delivery',
+                            picking_completed_at = datetime(picked_at, '+' || (15 + ABS(RANDOM()) % 31) || ' minutes')
                         WHERE order_id IN (
                             SELECT order_id FROM bundle_stops WHERE bundle_id = ?
                         )
+                        AND picking_completed_at IS NULL
                     """, (bundle_id,))
+                    
+                    # Update bundle picked_up_at to match the earliest picked_at from orders
+                    cursor.execute("""
+                        UPDATE bundles
+                        SET picked_up_at = (
+                            SELECT MIN(o.picked_at)
+                            FROM bundle_stops bs
+                            JOIN orders o ON bs.order_id = o.order_id
+                            WHERE bs.bundle_id = ?
+                        )
+                        WHERE bundle_id = ?
+                    """, (bundle_id, bundle_id))
+                    
                     print(f"[{datetime.now().strftime('%H:%M:%S')}] Bundle {bundle_id[:8]}... out for delivery")
                 
                 # Find bundles with orders in 'out_for_delivery' status for sequential delivery
@@ -213,7 +252,7 @@ async def delivery_simulator():
                 for bundle_id, est_duration in delivery_bundles:
                     # Get ordered stops for this bundle
                     cursor.execute("""
-                        SELECT bs.order_id, bs.stop_sequence, o.picked_at
+                        SELECT bs.order_id, bs.stop_sequence, o.picking_completed_at
                         FROM bundle_stops bs
                         JOIN orders o ON bs.order_id = o.order_id
                         WHERE bs.bundle_id = ?
@@ -226,13 +265,13 @@ async def delivery_simulator():
                         # Calculate time between stops based on total duration
                         time_per_stop = (est_duration or 30) / max(len(stops), 1)
                         
-                        for order_id, sequence, picked_at in stops:
+                        for order_id, sequence, picking_completed_at in stops:
                             # Each stop gets delivered at incremental times
                             from datetime import timedelta
-                            picked_dt = datetime.fromisoformat(picked_at)
+                            completed_dt = datetime.fromisoformat(picking_completed_at) if picking_completed_at else datetime.now()
                             # Base delay (20 min to start delivery) + sequence-based increments
                             delivery_delay = timedelta(minutes=20 + (sequence * time_per_stop))
-                            delivered_at = picked_dt + delivery_delay
+                            delivered_at = completed_dt + delivery_delay
                             
                             # Only mark as delivered if enough time has passed
                             if datetime.now() >= delivered_at:
@@ -242,9 +281,135 @@ async def delivery_simulator():
                                     WHERE order_id = ?
                                 """, (delivered_at.isoformat(), order_id))
                                 print(f"[{datetime.now().strftime('%H:%M:%S')}] Delivered order {order_id[:8]}... (stop {sequence + 1})")
+                        
+                        # Check if all orders in this bundle are now delivered
+                        cursor.execute("""
+                            SELECT COUNT(*) as total,
+                                   SUM(CASE WHEN o.status = 'delivered' THEN 1 ELSE 0 END) as delivered
+                            FROM bundle_stops bs
+                            JOIN orders o ON bs.order_id = o.order_id
+                            WHERE bs.bundle_id = ?
+                        """, (bundle_id,))
+                        total, delivered = cursor.fetchone()
+                        
+                        # If all orders delivered, set bundle completed_at to last delivery time
+                        if total > 0 and total == delivered:
+                            cursor.execute("""
+                                UPDATE bundles
+                                SET completed_at = (
+                                    SELECT MAX(o.delivered_at)
+                                    FROM bundle_stops bs
+                                    JOIN orders o ON bs.order_id = o.order_id
+                                    WHERE bs.bundle_id = ?
+                                )
+                                WHERE bundle_id = ?
+                            """, (bundle_id, bundle_id))
+                            print(f"[{datetime.now().strftime('%H:%M:%S')}] Bundle {bundle_id[:8]}... completed!")
                 
         except Exception as e:
             print(f"Error in delivery simulation: {e}")
+            await asyncio.sleep(10)
+
+
+async def order_cancellation_simulator():
+    """Background task: randomly cancels orders at different lifecycle stages with decreasing probability."""
+    from db import get_cursor
+    
+    while state.delivery_simulation_active:  # Shares same activation flag as delivery
+        try:
+            await asyncio.sleep(15)  # Check every 15 seconds
+            
+            if not state.delivery_simulation_active:
+                break
+            
+            with get_cursor() as cursor:
+                # Pending orders: 4% cancellation rate (highest)
+                cursor.execute("""
+                    SELECT order_id FROM orders 
+                    WHERE status = 'pending'
+                    AND datetime(created_at, '+2 minutes') < datetime('now')
+                """)
+                pending_orders = cursor.fetchall()
+                
+                for (order_id,) in pending_orders:
+                    if random.random() < 0.04:  # 4% chance
+                        cursor.execute(
+                            "UPDATE orders SET status = 'canceled' WHERE order_id = ?",
+                            (order_id,)
+                        )
+                        print(f"[{datetime.now().strftime('%H:%M:%S')}] Canceled order {order_id[:8]}... (pending stage)")
+                
+                # Confirmed orders: 3% cancellation rate
+                cursor.execute("""
+                    SELECT order_id FROM orders 
+                    WHERE status = 'confirmed'
+                    AND datetime(confirmed_at, '+5 minutes') < datetime('now')
+                """)
+                confirmed_orders = cursor.fetchall()
+                
+                for (order_id,) in confirmed_orders:
+                    if random.random() < 0.03:  # 3% chance
+                        cursor.execute(
+                            "UPDATE orders SET status = 'canceled' WHERE order_id = ?",
+                            (order_id,)
+                        )
+                        print(f"[{datetime.now().strftime('%H:%M:%S')}] Canceled order {order_id[:8]}... (confirmed stage)")
+                
+                # Picking orders: 2% cancellation rate
+                cursor.execute("""
+                    SELECT order_id FROM orders 
+                    WHERE status = 'picking'
+                    AND datetime(picked_at, '+5 minutes') < datetime('now')
+                """)
+                picking_orders = cursor.fetchall()
+                
+                for (order_id,) in picking_orders:
+                    if random.random() < 0.02:  # 2% chance
+                        cursor.execute(
+                            "UPDATE orders SET status = 'canceled' WHERE order_id = ?",
+                            (order_id,)
+                        )
+                        print(f"[{datetime.now().strftime('%H:%M:%S')}] Canceled order {order_id[:8]}... (picking stage)")
+                
+                # Out for delivery orders: 1% cancellation rate (lowest, rare)
+                cursor.execute("""
+                    SELECT order_id FROM orders 
+                    WHERE status = 'out_for_delivery'
+                    AND datetime(picked_at, '+15 minutes') < datetime('now')
+                """)
+                delivery_orders = cursor.fetchall()
+                
+                for (order_id,) in delivery_orders:
+                    if random.random() < 0.01:  # 1% chance
+                        cursor.execute(
+                            "UPDATE orders SET status = 'canceled' WHERE order_id = ?",
+                            (order_id,)
+                        )
+                        print(f"[{datetime.now().strftime('%H:%M:%S')}] Canceled order {order_id[:8]}... (out for delivery - rare!)")
+                
+        except Exception as e:
+            print(f"Error in cancellation simulation: {e}")
+            await asyncio.sleep(15)
+
+
+async def automatic_prediction_sender():
+    """Background task: sends confirmed orders to prediction service in batches."""
+    while state.prediction_sending_active:
+        try:
+            await asyncio.sleep(state.prediction_interval_seconds)
+            
+            if state.prediction_sending_active:
+                # Fetch and send confirmed orders
+                result = await state.prediction_service.process_confirmed_orders(batch_size=10)
+                
+                if result["total_orders"] > 0:
+                    print(
+                        f"[{datetime.now().strftime('%H:%M:%S')}] "
+                        f"Sent {result['total_orders']} confirmed orders for prediction "
+                        f"({result['successful_batches']}/{result['batches_sent']} batches successful)"
+                    )
+        except Exception as e:
+            print(f"Error sending predictions: {e}")
             await asyncio.sleep(10)
 
 
@@ -325,7 +490,7 @@ async def lifespan(app: FastAPI):
     # Generate stores
     if counts.get('stores', 0) < 5:
         print("🏪 Generating stores...")
-        stores = state.store_gen.generate_batch(10)
+        stores = state.store_gen.generate_batch(15)  # Increased from 10
         state.store_gen.save_to_db(stores)
         
         # Generate inventory for each store
@@ -337,12 +502,12 @@ async def lifespan(app: FastAPI):
     
     if counts.get('customers', 0) < 10:
         print("👥 Generating initial customers...")
-        customers = state.customer_gen.generate_batch(50)
+        customers = state.customer_gen.generate_batch(100)  # Increased from 50
         state.customer_gen.save_to_db(customers)
     
     if counts.get('drivers', 0) < 5:
         print("🚗 Generating initial drivers...")
-        drivers = state.driver_gen.generate_batch(20)
+        drivers = state.driver_gen.generate_batch(40)  # Increased from 20
         state.driver_gen.save_to_db(drivers)
     
     print("✅ API ready!")
@@ -351,11 +516,14 @@ async def lifespan(app: FastAPI):
     # Cleanup
     state.order_generation_active = False
     state.bundle_processing_active = False
+    state.delivery_simulation_active = False
+    state.prediction_sending_active = False
     state.customer_generation_active = False
     state.driver_generation_active = False
     state.store_generation_active = False
     
-    for task in [state.order_task, state.bundle_task, state.customer_task, 
+    for task in [state.order_task, state.bundle_task, state.delivery_task,
+                 state.cancellation_task, state.prediction_task, state.customer_task, 
                  state.driver_task, state.store_task]:
         if task:
             task.cancel()
@@ -411,11 +579,13 @@ async def get_service_status():
         order_generation_active=state.order_generation_active,
         bundle_processing_active=state.bundle_processing_active,
         delivery_simulation_active=state.delivery_simulation_active,
+        prediction_sending_active=state.prediction_sending_active,
         customer_generation_active=state.customer_generation_active,
         driver_generation_active=state.driver_generation_active,
         store_generation_active=state.store_generation_active,
         order_interval_seconds=state.order_interval_seconds,
         bundle_interval_seconds=state.bundle_interval_seconds,
+        prediction_interval_seconds=state.prediction_interval_seconds,
         customer_interval_seconds=state.customer_interval_seconds,
         driver_interval_seconds=state.driver_interval_seconds,
         store_interval_seconds=state.store_interval_seconds,
@@ -811,6 +981,13 @@ async def get_order(order_id: str):
 # Bundle Endpoints
 # =============================================================================
 
+@app.post("/predictions/send", response_model=PredictionResponse, tags=["Predictions"])
+async def send_predictions(batch_size: int = Query(10, description="Number of orders per batch")):
+    """Send confirmed orders to external prediction service in batches."""
+    result = await state.prediction_service.process_confirmed_orders(batch_size=batch_size)
+    return result
+
+
 @app.post("/bundles/process", response_model=BundleResponse, tags=["Bundles"])
 async def process_bundles_now():
     """Process pending orders into bundles immediately."""
@@ -1011,9 +1188,34 @@ async def stop_store_generation():
     return {"status": "stopped"}
 
 
+@app.post("/services/predictions/start", tags=["Services"])
+async def start_prediction_sending(background_tasks: BackgroundTasks):
+    """Start automatic prediction sending for confirmed orders."""
+    if state.prediction_sending_active:
+        return {"status": "already_running"}
+    
+    state.prediction_sending_active = True
+    state.prediction_task = asyncio.create_task(automatic_prediction_sender())
+    return {
+        "status": "started",
+        "interval_seconds": state.prediction_interval_seconds,
+        "batch_size": 10,
+    }
+
+
+@app.post("/services/predictions/stop", tags=["Services"])
+async def stop_prediction_sending():
+    """Stop automatic prediction sending."""
+    state.prediction_sending_active = False
+    if state.prediction_task:
+        state.prediction_task.cancel()
+        state.prediction_task = None
+    return {"status": "stopped"}
+
+
 @app.post("/services/start-all", tags=["Services"])
 async def start_all_services(background_tasks: BackgroundTasks):
-    """Start all background services (orders, bundles, customers, drivers, stores)."""
+    """Start all background services (orders, bundles, predictions, customers, drivers, stores)."""
     results = {}
     
     if not state.order_generation_active:
@@ -1033,9 +1235,17 @@ async def start_all_services(background_tasks: BackgroundTasks):
     if not state.delivery_simulation_active:
         state.delivery_simulation_active = True
         state.delivery_task = asyncio.create_task(delivery_simulator())
+        state.cancellation_task = asyncio.create_task(order_cancellation_simulator())
         results["delivery_simulation"] = "started"
     else:
         results["delivery_simulation"] = "already_running"
+    
+    if not state.prediction_sending_active:
+        state.prediction_sending_active = True
+        state.prediction_task = asyncio.create_task(automatic_prediction_sender())
+        results["predictions"] = "started"
+    else:
+        results["predictions"] = "already_running"
     
     if not state.customer_generation_active:
         state.customer_generation_active = True
@@ -1067,18 +1277,22 @@ async def stop_all_services():
     state.order_generation_active = False
     state.bundle_processing_active = False
     state.delivery_simulation_active = False
+    state.prediction_sending_active = False
     state.customer_generation_active = False
     state.driver_generation_active = False
     state.store_generation_active = False
     
     for task in [state.order_task, state.bundle_task, state.delivery_task,
-                 state.customer_task, state.driver_task, state.store_task]:
+                 state.cancellation_task, state.prediction_task, state.customer_task, 
+                 state.driver_task, state.store_task]:
         if task:
             task.cancel()
     
     state.order_task = None
     state.bundle_task = None
     state.delivery_task = None
+    state.cancellation_task = None
+    state.prediction_task = None
     state.customer_task = None
     state.driver_task = None
     state.store_task = None
@@ -1093,6 +1307,8 @@ async def update_service_config(config: ConfigUpdate):
         state.order_interval_seconds = config.order_interval_seconds
     if config.bundle_interval_seconds is not None:
         state.bundle_interval_seconds = config.bundle_interval_seconds
+    if config.prediction_interval_seconds is not None:
+        state.prediction_interval_seconds = config.prediction_interval_seconds
     if config.customer_interval_seconds is not None:
         state.customer_interval_seconds = config.customer_interval_seconds
     if config.driver_interval_seconds is not None:
@@ -1103,6 +1319,7 @@ async def update_service_config(config: ConfigUpdate):
     return {
         "order_interval_seconds": state.order_interval_seconds,
         "bundle_interval_seconds": state.bundle_interval_seconds,
+        "prediction_interval_seconds": state.prediction_interval_seconds,
         "customer_interval_seconds": state.customer_interval_seconds,
         "driver_interval_seconds": state.driver_interval_seconds,
         "store_interval_seconds": state.store_interval_seconds,

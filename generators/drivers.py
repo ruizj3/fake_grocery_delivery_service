@@ -1,7 +1,9 @@
 import uuid
 import random
+import math
 from datetime import datetime, timedelta
 from .base import BaseGenerator
+from .geofence import get_all_zones, get_zone_weights
 from models import Driver
 from db import get_cursor
 
@@ -17,14 +19,8 @@ class DriverGenerator(BaseGenerator):
     
     def __init__(self, seed: int | None = 42):
         super().__init__(seed)
-        # Drivers spread across the same metro areas as customers
-        self.metro_centers = [
-            {"lat": 37.7749, "lon": -122.4194},   # SF
-            {"lat": 37.8044, "lon": -122.2712},   # Oakland
-            {"lat": 37.3382, "lon": -121.8863},   # San Jose
-            {"lat": 37.8716, "lon": -122.2727},   # Berkeley
-            {"lat": 37.4419, "lon": -122.1430},   # Palo Alto
-        ]
+        # Drivers distributed across delivery zones
+        self.delivery_zones = get_all_zones()
     
     def _weighted_choice(self, choices: list[tuple]) -> str:
         items, weights = zip(*choices)
@@ -34,11 +30,20 @@ class DriverGenerator(BaseGenerator):
         return f"{random.randint(1, 9)}{self.fake.random_uppercase_letter()}{self.fake.random_uppercase_letter()}{self.fake.random_uppercase_letter}{random.randint(100, 999)}"
     
     def generate_one(self) -> Driver:
-        metro = random.choice(self.metro_centers)
+        # Select zone based on weights
+        zone = random.choices(self.delivery_zones, weights=get_zone_weights())[0]
         
-        # Drivers have wider spread than customers (they travel)
-        lat = metro["lat"] + random.uniform(-0.1, 0.1)
-        lon = metro["lon"] + random.uniform(-0.1, 0.1)
+        # Drivers have wider spread within zone (they travel for deliveries)
+        # Use up to 80% of zone radius
+        r = zone["radius_km"] * 0.8 * math.sqrt(random.random())
+        theta = random.uniform(0, 2 * math.pi)
+        
+        # Convert to lat/lon offset
+        lat_offset = (r * math.cos(theta)) / 111.0
+        lon_offset = (r * math.sin(theta)) / (111.0 * math.cos(math.radians(zone["lat"])))
+        
+        lat = zone["lat"] + lat_offset
+        lon = zone["lon"] + lon_offset
         
         # Random signup date within last 3 years
         days_ago = random.randint(0, 1095)

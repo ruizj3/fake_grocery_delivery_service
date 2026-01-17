@@ -29,12 +29,12 @@ def generate_data(num_orders: int, seed: int = 42):
     # Scale other entities relative to orders
     num_customers = max(100, num_orders // 5)   # ~5 orders per customer avg
     num_drivers = max(20, num_orders // 50)     # ~50 orders per driver avg
-    num_stores = max(5, num_orders // 100)      # ~100 orders per store avg
+    num_stores = max(12, num_orders // 80)      # ~80 orders per store avg (2 per city min)
     
     print(f"\n📊 Generating data for {num_orders} orders...")
     print(f"   - {num_customers} customers")
     print(f"   - {num_drivers} drivers")
-    print(f"   - {num_stores} store locations")
+    print(f"   - {num_stores} store locations (spread across 6 cities)")
     print(f"   - Full product catalog\n")
     
     # Generate customers

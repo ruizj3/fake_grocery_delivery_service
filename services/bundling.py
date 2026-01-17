@@ -37,6 +37,8 @@ class Bundle:
     total_distance_km: float = 0.0
     estimated_duration_min: float = 0.0
     created_at: datetime = field(default_factory=datetime.now)
+    centroid_lat: float = 0.0
+    centroid_lon: float = 0.0
     
     @property
     def order_count(self) -> int:
@@ -163,9 +165,9 @@ class BundlingService:
     
     def __init__(
         self,
-        time_window_minutes: int = 30,
-        max_bundle_size: int = 5,
-        max_radius_km: float = 5.0,
+        time_window_minutes: int = 45,  # Reasonable bundling window
+        max_bundle_size: int = 6,  # Realistic bundle size
+        max_radius_km: float = 5.0,  # Tighter radius for city delivery
         avg_speed_kmh: float = 25.0,
         stop_time_minutes: float = 5.0,
     ):
@@ -190,14 +192,37 @@ class BundlingService:
     
     def fetch_pending_orders(self, 
                              start_time: datetime | None = None,
-                             end_time: datetime | None = None) -> list[DeliveryStop]:
-        """Fetch confirmed orders ready for bundling."""
+                             end_time: datetime | None = None,
+                             include_delivered: bool = False) -> list[DeliveryStop]:
+        """Fetch orders ready for bundling.
         
-        query = """
+        Args:
+            start_time: Optional start time filter
+            end_time: Optional end time filter
+            include_delivered: If True, includes all order statuses for historical analysis.
+                             If False (default), only fetches pending/confirmed orders.
+                             
+        Returns:
+            List of DeliveryStop objects ready for bundling
+            
+        Note:
+            For LIVE API usage, always use default (include_delivered=False) to avoid
+            re-bundling already completed or canceled orders. Only set to True for
+            historical/offline analysis of past deliveries.
+        """
+        
+        if include_delivered:
+            # For historical analysis, bundle all non-canceled orders
+            status_clause = "status IN ('confirmed', 'pending', 'picking', 'out_for_delivery', 'delivered')"
+        else:
+            # For live bundling, only process pending/confirmed orders (excludes delivered/canceled)
+            status_clause = "status IN ('confirmed', 'pending')"
+        
+        query = f"""
             SELECT order_id, store_id, delivery_latitude, delivery_longitude, 
                    created_at, customer_id, total
             FROM orders 
-            WHERE status IN ('confirmed', 'pending')
+            WHERE {status_clause}
         """
         params = []
         
@@ -355,7 +380,7 @@ class BundlingService:
                     bundle_id=str(uuid.uuid4()),
                     driver_id=None,
                     stops=[stop],
-                    created_at=stop.created_at,
+                    created_at=datetime.now(),  # Will be updated after all stops added
                 )
                 bundles.append(new_bundle)
         
@@ -379,47 +404,99 @@ class BundlingService:
                     store_lon
                 )
                 bundle.estimated_duration_min = self._estimate_duration(bundle)
+                
+                # Calculate and set centroid
+                bundle.centroid_lat, bundle.centroid_lon = get_centroid(bundle.stops)
+                
+                # Set bundle created_at to be after the latest order in the bundle
+                latest_order_time = max(stop.created_at for stop in bundle.stops)
+                # Add 1-5 minutes after the latest order before bundling happens
+                from datetime import timedelta
+                import random
+                bundle.created_at = latest_order_time + timedelta(minutes=random.randint(1, 5))
         
         return bundles
     
     def assign_drivers(self, bundles: list[Bundle]) -> list[Bundle]:
-        """Assign available drivers to bundles based on proximity."""
+        """Assign available drivers to bundles based on proximity within the same city.
+        
+        Only assigns drivers who are not currently on a delivery.
+        Enforces same-city constraint: drivers are only assigned to bundles in their city.
+        """
+        from generators.geofence import get_zone_for_coordinates
         
         with get_cursor() as cursor:
+            # Get drivers who are NOT currently on active deliveries
             cursor.execute("""
-                SELECT driver_id, home_latitude, home_longitude, rating
-                FROM drivers 
-                WHERE is_active = 1
-                ORDER BY rating DESC
+                SELECT DISTINCT d.driver_id, d.home_latitude, d.home_longitude, d.rating
+                FROM drivers d
+                WHERE d.is_active = 1
+                AND d.driver_id NOT IN (
+                    SELECT DISTINCT b.driver_id
+                    FROM bundles b
+                    JOIN bundle_stops bs ON b.bundle_id = bs.bundle_id
+                    JOIN orders o ON bs.order_id = o.order_id
+                    WHERE b.driver_id IS NOT NULL
+                    AND o.status IN ('picking', 'out_for_delivery')
+                )
+                ORDER BY d.rating DESC
             """)
-            drivers = cursor.fetchall()
+            available_drivers = cursor.fetchall()
         
-        if not drivers:
+        if not available_drivers:
+            print("Warning: No available drivers found. Using all active drivers.")
+            # Fallback to all active drivers if none are available
+            with get_cursor() as cursor:
+                cursor.execute("""
+                    SELECT driver_id, home_latitude, home_longitude, rating
+                    FROM drivers 
+                    WHERE is_active = 1
+                    ORDER BY rating DESC
+                """)
+                available_drivers = cursor.fetchall()
+        
+        if not available_drivers:
+            print("Warning: No drivers in system. Bundles created without driver assignment.")
             return bundles
         
-        available_drivers = list(drivers)
-        
-        for bundle in bundles:
-            if not available_drivers:
-                break
-            
-            # Find closest available driver to bundle centroid
+        # Assign drivers to bundles (city-aware)
+        for i, bundle in enumerate(bundles):
+            # Find closest available driver to bundle centroid IN THE SAME CITY
             centroid_lat, centroid_lon = get_centroid(bundle.stops)
+            bundle_zone = get_zone_for_coordinates(centroid_lat, centroid_lon)
             
-            best_driver_idx = 0
+            if bundle_zone is None:
+                print(f"Warning: Bundle {bundle.bundle_id} outside all zones")
+                continue
+            
+            # Filter drivers to same city as bundle
+            same_city_drivers = []
+            for idx, driver in enumerate(available_drivers):
+                driver_zone = get_zone_for_coordinates(driver[1], driver[2])
+                if driver_zone and driver_zone["city"] == bundle_zone["city"]:
+                    same_city_drivers.append((idx, driver))
+            
+            if not same_city_drivers:
+                print(f"Warning: No drivers in {bundle_zone['city']} for bundle {bundle.bundle_id[:8]}")
+                # Fallback to nearest driver overall
+                same_city_drivers = [(idx, driver) for idx, driver in enumerate(available_drivers)]
+            
+            # Find closest driver among same-city drivers
+            best_driver_idx = None
             best_dist = float('inf')
             
-            for i, driver in enumerate(available_drivers):
+            for idx, driver in same_city_drivers:
                 dist = haversine_distance(
                     centroid_lat, centroid_lon,
                     driver[1], driver[2]
                 )
                 if dist < best_dist:
                     best_dist = dist
-                    best_driver_idx = i
+                    best_driver_idx = idx
             
-            bundle.driver_id = available_drivers[best_driver_idx][0]
-            available_drivers.pop(best_driver_idx)
+            if best_driver_idx is not None:
+                bundle.driver_id = available_drivers[best_driver_idx][0]
+            # Don't remove driver from list - allow reuse if needed
         
         return bundles
     
@@ -427,38 +504,14 @@ class BundlingService:
         """Save bundles and their assignments to database."""
         
         with get_cursor() as cursor:
-            # Create bundles table if not exists
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS bundles (
-                    bundle_id TEXT PRIMARY KEY,
-                    driver_id TEXT,
-                    order_count INTEGER,
-                    total_value REAL,
-                    total_distance_km REAL,
-                    estimated_duration_min REAL,
-                    created_at TIMESTAMP,
-                    FOREIGN KEY (driver_id) REFERENCES drivers(driver_id)
-                )
-            """)
-            
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS bundle_stops (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    bundle_id TEXT,
-                    order_id TEXT,
-                    stop_sequence INTEGER,
-                    FOREIGN KEY (bundle_id) REFERENCES bundles(bundle_id),
-                    FOREIGN KEY (order_id) REFERENCES orders(order_id)
-                )
-            """)
-            
             # Insert bundles
             for bundle in bundles:
                 cursor.execute("""
                     INSERT INTO bundles 
                     (bundle_id, driver_id, order_count, total_value,
-                     total_distance_km, estimated_duration_min, created_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                     total_distance_km, estimated_duration_min, created_at, status,
+                     centroid_latitude, centroid_longitude)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, (
                     bundle.bundle_id,
                     bundle.driver_id,
@@ -467,14 +520,18 @@ class BundlingService:
                     bundle.total_distance_km,
                     bundle.estimated_duration_min,
                     bundle.created_at.isoformat(),
+                    'pending',  # Initial status
+                    bundle.centroid_lat,
+                    bundle.centroid_lon,
                 ))
                 
                 # Insert stops with sequence
                 for seq, stop in enumerate(bundle.stops):
+                    stop_id = str(uuid.uuid4())  # Generate unique ID for each stop
                     cursor.execute("""
-                        INSERT INTO bundle_stops (bundle_id, order_id, stop_sequence)
-                        VALUES (?, ?, ?)
-                    """, (bundle.bundle_id, stop.order_id, seq))
+                        INSERT INTO bundle_stops (id, bundle_id, order_id, stop_sequence)
+                        VALUES (?, ?, ?, ?)
+                    """, (stop_id, bundle.bundle_id, stop.order_id, seq))
         
         print(f"Saved {len(bundles)} bundles to database")
     
@@ -504,20 +561,29 @@ class BundlingService:
 
 
 def run_bundling_analysis():
-    """Run bundling on historical orders and print analysis."""
+    """Run bundling analysis on historical orders and print statistics.
+    
+    Note: This is for OFFLINE analysis only. It includes all order statuses
+    (pending, confirmed, picking, out_for_delivery, delivered) to calculate
+    bundle metrics for past deliveries. 
+    
+    The live API should NOT use this - it uses fetch_pending_orders() with
+    default parameters to only bundle new pending/confirmed orders.
+    """
     
     print("\n🚚 Running Bundle Analysis...")
     print("=" * 50)
     
     service = BundlingService(
-        time_window_minutes=30,
-        max_bundle_size=5,
+        time_window_minutes=45,
+        max_bundle_size=6,
         max_radius_km=5.0,
     )
     
-    # Get historical delivered orders
-    orders = service.fetch_all_delivered_orders()
-    print(f"\nFound {len(orders)} delivered orders")
+    # Get all orders (including delivered) for historical bundling analysis
+    # WARNING: Do NOT use include_delivered=True in live API - only for offline analysis
+    orders = service.fetch_pending_orders(include_delivered=True)
+    print(f"\nFound {len(orders)} orders for bundling analysis")
     
     if not orders:
         print("No orders to bundle.")
