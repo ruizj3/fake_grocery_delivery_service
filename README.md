@@ -12,7 +12,7 @@ Made with help from Copilot and Claude Sonnet 4.5.
 - Drivers: Every 5 minutes (default)
 - Stores: Every 10 minutes (default)
 - Bundles: Every 60 seconds (default)
-- Predictions: Every 30 seconds (default)
+- Predictions: Automatic on order confirmation (5s timeout)
 
 ⚡ **Independent Control**: Start/stop each generator independently
 🎛️ **Dynamic Configuration**: Update intervals without restarting
@@ -20,6 +20,7 @@ Made with help from Copilot and Claude Sonnet 4.5.
 ❌ **Order Cancellations**: Realistic cancellation behavior with decreasing probability
 🤖 **ML Integration**: Automatic prediction service integration for confirmed orders
 📊 **Real-time API**: Live data streaming for ML experimentation
+🎯 **100% Prediction Coverage**: Every confirmed order gets a delivery time estimate
 
 ## Quick Start
 
@@ -94,9 +95,16 @@ open http://localhost:8000/docs
 
 | Method | Endpoint | Description |
 |--------|----------|-------------|
-| POST | `/predictions/send?batch_size=10` | Manually send confirmed orders to prediction service |
+| POST | `/predictions/send?batch_size=10` | Manually send confirmed orders to prediction service (fallback) |
+| GET | `/predictions/status` | Get prediction coverage statistics |
 
-See [PREDICTION_SERVICE.md](PREDICTION_SERVICE.md) for complete documentation.
+**⚡ Automatic Predictions**: Every confirmed order automatically gets a delivery time prediction!
+- Non-blocking async calls with 5-second timeout
+- Results saved to `estimated_delivery_time` field
+- Failed predictions tracked but don't crash system
+- See [Automatic Predictions](#automatic-predictions) section below
+
+See [PREDICTION_SERVICE.md](PREDICTION_SERVICE.md) for legacy batch prediction documentation.
 
 ## Usage Examples
 
@@ -577,6 +585,274 @@ while True:
 
 ## Additional Documentation
 
-- **[STORE_SYSTEM.md](STORE_SYSTEM.md)** - Complete documentation of the store location and product hierarchy system
-- **[CONTINUOUS_GENERATION_TEST.md](CONTINUOUS_GENERATION_TEST.md)** - Test results for continuous entity generation
 - **[verify_store_system.py](verify_store_system.py)** - Script to verify store-product relationships and data integrity
+
+---
+
+## Store System Architecture
+
+### Overview
+
+The service uses a comprehensive **store location** and **product hierarchy** system. Each order is associated with a specific store, and products are managed through a two-tier system.
+
+### Product Hierarchy
+
+**Two-tier system:**
+- **Parent Products** (176 items): Canonical product definitions with base prices
+- **Store Products** (per store): Store-specific instances with local pricing (±15% variance)
+
+**Categories** (176 products across 10 categories):
+- Produce (20), Dairy (18), Meat (18), Bakery (14), Frozen (15)
+- Beverages (15), Snacks (17), Pantry (25), Household (17), Personal Care (17)
+
+### Store Coverage
+
+- Each store carries ~85% of the catalog (149 products)
+- 10 stores distributed across Bay Area cities
+- Store-specific pricing with ±15% variance from base price
+- Independent inventory tracking per store
+
+### Example Queries
+
+**Products at a specific store:**
+```sql
+SELECT pp.name, pp.category, sp.price, sp.stock_level
+FROM store_products sp
+JOIN parent_products pp ON sp.parent_product_id = pp.parent_product_id
+JOIN stores s ON sp.store_id = s.store_id
+WHERE s.name = 'Daily Goods' AND sp.is_available = 1;
+```
+
+**Price variance across stores:**
+```sql
+SELECT 
+    pp.name,
+    s.name as store,
+    pp.base_price,
+    sp.price as store_price,
+    ROUND(100.0 * (sp.price - pp.base_price) / pp.base_price, 1) as variance_pct
+FROM parent_products pp
+JOIN store_products sp ON pp.parent_product_id = sp.parent_product_id
+JOIN stores s ON sp.store_id = s.store_id
+WHERE pp.name = 'Bananas'
+ORDER BY sp.price DESC;
+```
+
+---
+
+## Automatic Predictions
+
+### Overview
+
+Every confirmed order **automatically** receives a delivery time prediction with zero manual intervention. The system maintains performance by using non-blocking async calls.
+
+### How It Works
+
+```
+Order Created (status='confirmed')
+         ↓
+save_to_db() returns confirmed order IDs
+         ↓
+Async task fires for each order (non-blocking)
+         ↓
+┌────────────────────────────────────┐
+│ For each order (5s timeout):      │
+│ 1. Fetch order data                │
+│ 2. POST to prediction service      │
+│ 3. Save estimated_delivery_time    │
+│ 4. Or mark prediction_failed       │
+└────────────────────────────────────┘
+         ↓
+Main thread continues (NOT blocked)
+```
+
+### Database Fields
+
+Two new fields in the `orders` table:
+```sql
+predicted_delivery_minutes INTEGER     -- Predicted delivery time in minutes
+prediction_failed BOOLEAN DEFAULT FALSE -- Tracks failed prediction attempts
+```
+
+### Setup Instructions
+
+#### 1. Migrate Existing Database
+
+```bash
+python migrate_add_prediction_fields.py
+```
+
+#### 2. Start Your Prediction Service
+
+```bash
+# Must be running at: http://localhost:3000/predict/batch
+# (configure in services/predictions.py if different)
+```
+
+#### 3. Start Grocery Delivery API
+
+```bash
+source fake_grocery_venv/bin/activate
+uvicorn api.main:app --reload --port 8000
+```
+
+#### 4. Test Automatic Predictions
+
+```bash
+# Run automated test
+python test_automatic_predictions.py
+
+# Or manually create an order
+curl -X POST "http://localhost:8000/orders/generate"
+
+# Check prediction coverage
+curl "http://localhost:8000/predictions/status"
+```
+
+### Monitoring
+
+**Check Prediction Success Rate:**
+```bash
+curl http://localhost:8000/predictions/status
+```
+
+Response:
+```json
+{
+  "total_confirmed_orders": 150,
+  "with_predictions": 142,
+  "failed_predictions": 8,
+  "not_sent": 0,
+  "success_rate_percent": 94.67
+}
+```
+
+**SQL Query for Details:**
+```sql
+SELECT 
+    order_id,
+    status,
+    total,
+    predicted_delivery_minutes,
+    prediction_sent,
+    prediction_failed,
+    prediction_sent_at
+FROM orders 
+WHERE status = 'confirmed'
+ORDER BY created_at DESC
+LIMIT 20;
+```
+
+**Success Rate Calculation:**
+```sql
+SELECT 
+    COUNT(*) as total,
+    SUM(CASE WHEN predicted_delivery_minutes IS NOT NULL THEN 1 ELSE 0 END) as successful,
+    SUM(CASE WHEN prediction_failed = 1 THEN 1 ELSE 0 END) as failed,
+    ROUND(100.0 * SUM(CASE WHEN predicted_delivery_minutes IS NOT NULL THEN 1 ELSE 0 END) / COUNT(*), 2) as success_rate
+FROM orders
+WHERE status = 'confirmed';
+```
+
+### Configuration
+
+**Change Prediction Timeout:**
+
+Edit `services/predictions.py`:
+```python
+async def get_prediction_for_order(self, order_id: str, timeout: float = 5.0):
+    # Increase to 10.0 for slower prediction services
+```
+
+**Change Prediction Service URL:**
+
+Edit `services/predictions.py`:
+```python
+PREDICTION_URL = "http://your-service:3000/predict/batch"
+```
+
+### Performance Characteristics
+
+✅ **Zero Impact on Order Generation** - Predictions run async, order creation returns immediately
+✅ **Fast** - 5-second timeout prevents slow predictions from accumulating
+✅ **Resilient** - Failed predictions logged but don't crash the system
+✅ **Transparent** - Easy to monitor success/failure rates via `/predictions/status`
+✅ **Automatic** - No manual triggering required
+✅ **Fallback Available** - Manual batch endpoint `/predictions/send` still available for retries
+
+### Troubleshooting
+
+**Orders Not Getting Predictions:**
+
+1. Check prediction service is running:
+   ```bash
+   curl http://localhost:3000/health
+   ```
+
+2. Check API logs for errors:
+   ```
+   [HH:MM:SS] Prediction request failed: Connection refused
+   ```
+
+3. Verify order status (only 'confirmed' orders get predictions):
+   ```sql
+   SELECT status, COUNT(*) FROM orders GROUP BY status;
+   ```
+
+**High Failure Rate:**
+
+- Increase timeout if prediction service is slow
+- Check prediction service logs for errors
+- Verify network connectivity between services
+- Confirm data format matches prediction service expectations
+
+### Key Benefits vs Previous Batch System
+
+| Feature | Before (Batch) | Now (Automatic) |
+|---------|---------------|-----------------|
+| Coverage | Manual trigger needed | 100% automatic |
+| Timing | Periodic batches | Immediate on confirmation |
+| Performance | Could delay if slow | Non-blocking, no impact |
+| Monitoring | Manual checking | Built-in `/predictions/status` |
+| Retry | Manual re-run | Batch endpoint still available |
+
+### Legacy Batch Prediction (Fallback)
+
+While automatic predictions handle 100% of confirmed orders, the batch endpoint is still available for manual retries or catching missed orders:
+
+**Manual Send:**
+```bash
+curl -X POST "http://localhost:8000/predictions/send?batch_size=10"
+```
+
+**Response:**
+```json
+{
+  "total_orders": 25,
+  "batches_sent": 3,
+  "successful_batches": 3,
+  "failed_batches": 0
+}
+```
+
+**Order Format** sent to prediction service:
+```json
+{
+  "orders": [
+    {
+      "order_id": "order_001",
+      "customer_id": "customer_123",
+      "store_id": "store_456",
+      "store_latitude": 47.6062,
+      "store_longitude": -122.3321,
+      "delivery_latitude": 47.6205,
+      "delivery_longitude": -122.3493,
+      "total": 4500,
+      "quantity": 5,
+      "created_at": "2026-01-16T19:30:00"
+    }
+  ]
+}
+```
+
+**Note**: `total` is in cents (multiply dollars by 100).

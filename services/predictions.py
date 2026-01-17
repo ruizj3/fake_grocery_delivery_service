@@ -94,6 +94,16 @@ class PredictionService:
             async with httpx.AsyncClient(timeout=30.0) as client:
                 response = await client.post(PREDICTION_URL, json=payload)
                 response.raise_for_status()
+                result = response.json()
+                
+                # Save predictions from response
+                if result and "predictions" in result:
+                    for prediction in result["predictions"]:
+                        order_id = prediction.get("order_id")
+                        estimated_time = prediction.get("predicted_delivery_minutes")
+                        
+                        if order_id and estimated_time:
+                            self._save_prediction(order_id, estimated_time)
                 
                 # Mark orders as sent
                 self._mark_orders_as_sent([o["order_id"] for o in orders])
@@ -101,7 +111,7 @@ class PredictionService:
                 return {
                     "success": True,
                     "status_code": response.status_code,
-                    "data": response.json(),
+                    "data": result,
                     "orders_sent": len(orders)
                 }
         except httpx.HTTPError as e:
@@ -133,6 +143,120 @@ class PredictionService:
         """
         
         cursor.execute(query, order_ids)
+        conn.commit()
+        conn.close()
+    
+    async def get_prediction_for_order(self, order_id: str, timeout: float = 5.0) -> Optional[int]:
+        """
+        Get delivery time prediction for a single order immediately.
+        
+        Args:
+            order_id: The order ID to predict for
+            timeout: Request timeout in seconds (default 5s for fast response)
+        
+        Returns:
+            Estimated delivery time in minutes, or None if prediction fails
+        """
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        
+        # Fetch the single order data
+        cursor.execute("""
+            SELECT 
+                o.order_id,
+                o.customer_id,
+                o.store_id,
+                s.latitude as store_latitude,
+                s.longitude as store_longitude,
+                c.latitude as delivery_latitude,
+                c.longitude as delivery_longitude,
+                o.total,
+                o.created_at,
+                COUNT(oi.order_item_id) as quantity
+            FROM orders o
+            JOIN customers c ON o.customer_id = c.customer_id
+            JOIN stores s ON o.store_id = s.store_id
+            LEFT JOIN order_items oi ON o.order_id = oi.order_id
+            WHERE o.order_id = ?
+            GROUP BY o.order_id
+        """, (order_id,))
+        
+        row = cursor.fetchone()
+        conn.close()
+        
+        if not row:
+            return None
+        
+        order_data = {
+            "order_id": row["order_id"],
+            "customer_id": row["customer_id"],
+            "store_id": row["store_id"],
+            "store_latitude": row["store_latitude"],
+            "store_longitude": row["store_longitude"],
+            "delivery_latitude": row["delivery_latitude"],
+            "delivery_longitude": row["delivery_longitude"],
+            "total": int(row["total"] * 100),
+            "quantity": row["quantity"],
+            "created_at": row["created_at"]
+        }
+        
+        try:
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                response = await client.post(
+                    PREDICTION_URL, 
+                    json={"orders": [order_data]}
+                )
+                response.raise_for_status()
+                result = response.json()
+                
+                # Extract prediction from response
+                # Prediction service returns field: "predicted_delivery_minutes"
+                if result and "predictions" in result and len(result["predictions"]) > 0:
+                    prediction = result["predictions"][0]
+                    estimated_time = prediction.get("predicted_delivery_minutes")
+                    
+                    if estimated_time:
+                        # Update order with prediction
+                        self._save_prediction(order_id, estimated_time)
+                        return estimated_time
+                
+                return None
+                
+        except (httpx.HTTPError, httpx.TimeoutException, Exception) as e:
+            # Mark prediction as failed but don't crash
+            self._mark_prediction_failed(order_id)
+            return None
+    
+    def _save_prediction(self, order_id: str, estimated_time: int):
+        """Save prediction result to database."""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        
+        cursor.execute("""
+            UPDATE orders 
+            SET predicted_delivery_minutes = ?,
+                prediction_sent = 1,
+                prediction_sent_at = datetime('now'),
+                prediction_failed = 0
+            WHERE order_id = ?
+        """, (estimated_time, order_id))
+        
+        conn.commit()
+        conn.close()
+    
+    def _mark_prediction_failed(self, order_id: str):
+        """Mark that prediction failed for this order."""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        
+        cursor.execute("""
+            UPDATE orders 
+            SET prediction_failed = 1,
+                prediction_sent_at = datetime('now')
+            WHERE order_id = ?
+        """, (order_id,))
+        
         conn.commit()
         conn.close()
     

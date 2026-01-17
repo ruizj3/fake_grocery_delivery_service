@@ -151,6 +151,8 @@ def init_database(reset: bool = False):
             delivery_notes TEXT,
             prediction_sent BOOLEAN DEFAULT FALSE,
             prediction_sent_at TIMESTAMP,
+            predicted_delivery_minutes INTEGER,
+            prediction_failed BOOLEAN DEFAULT FALSE,
             FOREIGN KEY (customer_id) REFERENCES customers(customer_id),
             FOREIGN KEY (store_id) REFERENCES stores(store_id)
         )

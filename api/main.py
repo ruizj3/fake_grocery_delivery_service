@@ -120,6 +120,21 @@ class AppState:
 state = AppState()
 
 
+async def request_prediction_for_orders(order_ids: list[str]):
+    """Helper to request predictions for confirmed orders without blocking."""
+    if not order_ids:
+        return
+    
+    try:
+        prediction_service = PredictionService()
+        for order_id in order_ids:
+            # Fire and forget - don't wait for response
+            await prediction_service.get_prediction_for_order(order_id)
+    except Exception as e:
+        # Silent failure - don't crash the order generation
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] Prediction request failed: {e}")
+
+
 async def random_order_generator():
     """Background task: generates orders at random intervals."""
     while state.order_generation_active:
@@ -130,8 +145,12 @@ async def random_order_generator():
             
             if state.order_generation_active:
                 order, items = state.order_gen.generate_one()
-                state.order_gen.save_to_db(([order], items))
+                confirmed_order_ids = state.order_gen.save_to_db(([order], items))
                 print(f"[{datetime.now().strftime('%H:%M:%S')}] Generated order {order.order_id[:8]}... (${order.total:.2f})")
+                
+                # Immediately request prediction for confirmed orders
+                if confirmed_order_ids:
+                    asyncio.create_task(request_prediction_for_orders(confirmed_order_ids))
         except Exception as e:
             print(f"Error generating order: {e}")
             await asyncio.sleep(5)
@@ -889,7 +908,12 @@ async def list_categories():
 async def generate_order():
     """Generate a single order immediately."""
     order, items = state.order_gen.generate_one()
-    state.order_gen.save_to_db(([order], items))
+    confirmed_order_ids = state.order_gen.save_to_db(([order], items))
+    
+    # Request prediction for confirmed orders
+    if confirmed_order_ids:
+        asyncio.create_task(request_prediction_for_orders(confirmed_order_ids))
+    
     return OrderResponse(
         order_id=order.order_id,
         customer_id=order.customer_id,
@@ -903,7 +927,12 @@ async def generate_order():
 async def generate_orders_batch(count: int = Query(default=10, ge=1, le=100)):
     """Generate multiple orders at once."""
     orders, items = state.order_gen.generate_batch(count)
-    state.order_gen.save_to_db((orders, items))
+    confirmed_order_ids = state.order_gen.save_to_db((orders, items))
+    
+    # Request predictions for confirmed orders
+    if confirmed_order_ids:
+        asyncio.create_task(request_prediction_for_orders(confirmed_order_ids))
+    
     return {
         "count": len(orders),
         "total_items": len(items),
@@ -986,6 +1015,38 @@ async def send_predictions(batch_size: int = Query(10, description="Number of or
     """Send confirmed orders to external prediction service in batches."""
     result = await state.prediction_service.process_confirmed_orders(batch_size=batch_size)
     return result
+
+
+@app.get("/predictions/status", tags=["Predictions"])
+async def get_prediction_status():
+    """Get statistics about prediction coverage for confirmed orders."""
+    from db import get_cursor
+    with get_cursor() as cursor:
+        cursor.execute("""
+            SELECT 
+                COUNT(*) as total_confirmed,
+                SUM(CASE WHEN predicted_delivery_minutes IS NOT NULL THEN 1 ELSE 0 END) as with_predictions,
+                SUM(CASE WHEN prediction_failed = 1 THEN 1 ELSE 0 END) as failed_predictions,
+                SUM(CASE WHEN prediction_sent = 0 OR prediction_sent IS NULL THEN 1 ELSE 0 END) as not_sent
+            FROM orders
+            WHERE status = 'confirmed'
+        """)
+        
+        row = cursor.fetchone()
+        total = row[0] if row else 0
+        with_pred = row[1] if row else 0
+        failed = row[2] if row else 0
+        not_sent = row[3] if row else 0
+        
+        success_rate = round(100.0 * with_pred / total, 2) if total > 0 else 0
+        
+        return {
+            "total_confirmed_orders": total,
+            "with_predictions": with_pred,
+            "failed_predictions": failed,
+            "not_sent": not_sent,
+            "success_rate_percent": success_rate,
+        }
 
 
 @app.post("/bundles/process", response_model=BundleResponse, tags=["Bundles"])

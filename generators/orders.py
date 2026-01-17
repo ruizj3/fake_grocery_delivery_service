@@ -556,3 +556,7 @@ class OrderGenerator(BaseGenerator):
             )
         
         print(f"Saved {len(orders)} orders and {len(items)} order items")
+        
+        # Return list of confirmed order IDs for immediate prediction
+        confirmed_order_ids = [o.order_id for o in orders if o.status == OrderStatus.CONFIRMED]
+        return confirmed_order_ids
