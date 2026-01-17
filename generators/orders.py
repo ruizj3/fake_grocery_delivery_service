@@ -41,6 +41,7 @@ class Order:
     created_at: datetime
     confirmed_at: datetime | None
     picked_at: datetime | None
+    picking_completed_at: datetime | None
     delivered_at: datetime | None
     delivery_latitude: float
     delivery_longitude: float
@@ -147,6 +148,77 @@ class OrderGenerator(BaseGenerator):
         )[0]
         return round(subtotal * tip_pct, 2)
     
+    def _generate_order_status(self, created_at: datetime) -> OrderStatus:
+        """Generate initial order status.
+        
+        New orders start as PENDING or CONFIRMED.
+        The background cancellation simulator service will cancel orders
+        as they progress through the lifecycle based on their current status.
+        
+        For batch/historical generation, you can generate a mix of statuses
+        to simulate orders at different stages.
+        """
+        # Orders start as pending or confirmed
+        # They progress through the lifecycle naturally via the bundling/delivery services
+        # Cancellations happen via the live cancellation simulator
+        return random.choices(
+            [OrderStatus.PENDING, OrderStatus.CONFIRMED, OrderStatus.PICKING, 
+             OrderStatus.OUT_FOR_DELIVERY, OrderStatus.DELIVERED],
+            weights=[0.10, 0.20, 0.05, 0.05, 0.60]  # Mix of statuses for historical data
+        )[0]
+    
+    def _generate_timestamps(self, status: OrderStatus, created_at: datetime) -> tuple[datetime | None, datetime | None, datetime | None, datetime | None]:
+        """Generate realistic timestamps based on order status.
+        
+        Timestamps are guaranteed to be chronological:
+        created_at < confirmed_at < picked_at < picking_completed_at < delivered_at
+        
+        Note: This generator does NOT create canceled orders.
+        Cancellations happen via the live cancellation simulator service.
+        """
+        confirmed_at = None
+        picked_at = None
+        picking_completed_at = None
+        delivered_at = None
+        
+        # Set timestamps progressively based on status
+        # Each timestamp builds on the previous one, ensuring chronological order
+        
+        if status in [OrderStatus.CONFIRMED, OrderStatus.PICKING, OrderStatus.OUT_FOR_DELIVERY, 
+                      OrderStatus.DELIVERED]:
+            # Order confirmed 2-15 minutes after creation
+            confirmed_at = created_at + timedelta(minutes=random.randint(2, 15))
+        
+        # Orders that reach picking stage
+        if status in [OrderStatus.PICKING, OrderStatus.OUT_FOR_DELIVERY, OrderStatus.DELIVERED]:
+            if confirmed_at:
+                # Picking started 20-90 minutes after confirmation (includes bundling wait time)
+                picked_at = confirmed_at + timedelta(minutes=random.randint(20, 90))
+        
+        # Orders that complete picking and go out for delivery
+        if status in [OrderStatus.OUT_FOR_DELIVERY, OrderStatus.DELIVERED]:
+            if picked_at:
+                # Picking completed 15-45 minutes after picking started (shopping time)
+                picking_completed_at = picked_at + timedelta(minutes=random.randint(15, 45))
+        
+        # Only delivered orders get delivered_at timestamp
+        if status == OrderStatus.DELIVERED:
+            if picking_completed_at:
+                # Delivered 30-90 minutes after picking completed (driving + multiple stops)
+                delivered_at = picking_completed_at + timedelta(minutes=random.randint(30, 90))
+        
+        # Validate chronological order (defensive programming)
+        if confirmed_at and confirmed_at <= created_at:
+            raise ValueError(f"confirmed_at must be after created_at")
+        if picked_at and confirmed_at and picked_at <= confirmed_at:
+            raise ValueError(f"picked_at must be after confirmed_at")
+        if picking_completed_at and picked_at and picking_completed_at <= picked_at:
+            raise ValueError(f"picking_completed_at must be after picked_at")
+        if delivered_at and picking_completed_at and delivered_at <= picking_completed_at:
+            raise ValueError(f"delivered_at must be after picking_completed_at")
+        
+        return confirmed_at, picked_at, picking_completed_at, delivered_at
+    
     def _get_delivery_fee(self, subtotal: float, is_premium: bool) -> float:
         """Calculate delivery fee."""
         if is_premium:
@@ -154,26 +226,50 @@ class OrderGenerator(BaseGenerator):
         return self.BASE_DELIVERY_FEE if subtotal < 35 else 3.99
     
     def _select_store_for_customer(self, customer_lat: float, customer_lon: float) -> str:
-        """Select a store for the customer, weighted by proximity."""
+        """Select a store for the customer within the same city zone, weighted by proximity."""
         with get_cursor() as cursor:
+            # Get stores in the same city as customer
             cursor.execute(
-                "SELECT store_id, latitude, longitude FROM stores WHERE is_active = 1"
+                """SELECT store_id, city, latitude, longitude 
+                   FROM stores 
+                   WHERE is_active = 1"""
             )
-            stores = cursor.fetchall()
+            all_stores = cursor.fetchall()
         
-        if not stores:
+        if not all_stores:
             raise ValueError("No active stores found")
         
+        # Filter to stores in same city (based on geofence)
+        from .geofence import get_zone_for_coordinates
+        customer_zone = get_zone_for_coordinates(customer_lat, customer_lon)
+        
+        if customer_zone is None:
+            # Customer outside all zones, fall back to nearest store
+            stores = all_stores
+        else:
+            # Only consider stores in the same city
+            stores = [s for s in all_stores if s[1] == customer_zone["city"]]
+            if not stores:
+                # No stores in customer's city, fall back to all stores
+                stores = all_stores
+        
+        # Weight by distance (closer stores more likely)
         distances = []
         for store in stores:
-            dist = haversine_distance(customer_lat, customer_lon, store[1], store[2])
+            dist = haversine_distance(customer_lat, customer_lon, store[2], store[3])
             distances.append(max(0.1, dist))
         
-        weights = [1.0 / d for d in distances]
+        weights = [1.0 / (d ** 2) for d in distances]  # Square inverse for stronger proximity preference
         selected = random.choices(stores, weights=weights)[0]
         return selected[0]
     
-    def generate_one(self) -> tuple[Order, list[OrderItem]]:
+    def generate_one(self, live_mode: bool = True) -> tuple[Order, list[OrderItem]]:
+        """Generate a single order.
+        
+        Args:
+            live_mode: If True, creates a fresh order with current timestamp and pending/confirmed status.
+                      If False, creates historical order with random past timestamp and varied statuses.
+        """
         if not self._customer_ids:
             self._load_dependencies()
         
@@ -225,25 +321,26 @@ class OrderGenerator(BaseGenerator):
         subtotal = round(subtotal, 2)
         delivery_fee = self._get_delivery_fee(subtotal, is_premium)
         tax = round(subtotal * self.TAX_RATE, 2)
-        created_at = self._generate_order_time()
         
-        # For live generation: new orders start as 'pending' or 'confirmed'
-        # Bundling service will process them and update status
-        # For batch generation with historical data: use weighted random
-        status = random.choices(
-            [OrderStatus.PENDING, OrderStatus.CONFIRMED],
-            weights=[0.3, 0.7]
-        )[0]
+        if live_mode:
+            # Live orders: created NOW with pending/confirmed status
+            created_at = datetime.now()
+            status = random.choice([OrderStatus.PENDING, OrderStatus.CONFIRMED])
+            # Live orders start fresh - no historical timestamps
+            confirmed_at = created_at + timedelta(minutes=random.randint(1, 3)) if status == OrderStatus.CONFIRMED else None
+            picked_at = None
+            picking_completed_at = None
+            delivered_at = None
+        else:
+            # Historical orders: random past time with varied statuses and full lifecycle
+            created_at = self._generate_order_time()
+            status = self._generate_order_status(created_at)
+            confirmed_at, picked_at, picking_completed_at, delivered_at = self._generate_timestamps(
+                status, created_at
+            )
         
         tip = self._calculate_tip(subtotal, status)
         total = round(subtotal + tax + delivery_fee + tip, 2)
-        
-        confirmed_at = None
-        picked_at = None
-        delivered_at = None
-        
-        if status == OrderStatus.CONFIRMED:
-            confirmed_at = created_at + timedelta(minutes=random.randint(1, 5))
         
         order = Order(
             order_id=order_id,
@@ -258,6 +355,7 @@ class OrderGenerator(BaseGenerator):
             created_at=created_at,
             confirmed_at=confirmed_at,
             picked_at=picked_at,
+            picking_completed_at=picking_completed_at,
             delivered_at=delivered_at,
             delivery_latitude=customer_lat,
             delivery_longitude=customer_lon,
@@ -266,18 +364,155 @@ class OrderGenerator(BaseGenerator):
         
         return order, order_items
     
-    def generate_batch(self, count: int) -> tuple[list[Order], list[OrderItem]]:
+    def generate_batch(self, count: int, enable_clustering: bool = True, live_mode: bool = False) -> tuple[list[Order], list[OrderItem]]:
+        """Generate orders with optional temporal clustering for realistic bundling.
+        
+        Args:
+            count: Number of orders to generate
+            enable_clustering: If True, creates order bursts from same stores (better for bundling)
+            live_mode: If True, creates fresh orders. If False (default), creates historical data.
+        """
         self._load_dependencies()
         orders = []
         all_items = []
         
-        for i in range(count):
-            order, items = self.generate_one()
-            orders.append(order)
-            all_items.extend(items)
+        if enable_clustering and not live_mode:
+            # Generate orders in clusters for realistic bundling (historical data only)
+            orders, all_items = self._generate_clustered_batch(count)
+        else:
+            # Generate individual orders (for live mode or non-clustered batch)
+            for i in range(count):
+                order, items = self.generate_one(live_mode=live_mode)
+                orders.append(order)
+                all_items.extend(items)
+                
+                if (i + 1) % 100 == 0:
+                    print(f"Generated {i + 1}/{count} orders...")
+        
+        return orders, all_items
+    
+    def _generate_clustered_batch(self, count: int) -> tuple[list[Order], list[OrderItem]]:
+        """Generate orders with temporal clustering for realistic bundling.
+        
+        Creates bursts of 2-6 orders from the same store within 15-30 minute windows,
+        simulating realistic lunch/dinner rush patterns.
+        """
+        orders = []
+        all_items = []
+        remaining = count
+        
+        while remaining > 0:
+            # Decide cluster size (40% single orders, 60% clustered)
+            if random.random() < 0.4 or remaining == 1:
+                cluster_size = 1
+            else:
+                cluster_size = min(random.choices([2, 3, 4, 5, 6], weights=[30, 25, 20, 15, 10])[0], remaining)
             
-            if (i + 1) % 100 == 0:
-                print(f"Generated {i + 1}/{count} orders...")
+            # Generate base timestamp for this cluster
+            base_time = self._generate_order_time()
+            
+            # Pick a random store for this cluster
+            base_store_id = random.choice(self._store_ids)
+            
+            # Generate orders in this cluster
+            for i in range(cluster_size):
+                order_id = str(uuid.uuid4())
+                customer_id = random.choice(self._customer_ids)
+                
+                with get_cursor() as cursor:
+                    cursor.execute(
+                        "SELECT latitude, longitude, is_premium FROM customers WHERE customer_id = ?",
+                        (customer_id,)
+                    )
+                    row = cursor.fetchone()
+                    customer_lat, customer_lon, is_premium = row[0], row[1], bool(row[2])
+                
+                # Use the cluster's store (same store for bundling)
+                store_id = base_store_id
+                store_products = self._get_store_products(store_id)
+                
+                if not store_products:
+                    # Fallback to different store if no products
+                    store_id = self._select_store_for_customer(customer_lat, customer_lon)
+                    store_products = self._get_store_products(store_id)
+                
+                # Generate order items
+                num_items = random.choices(
+                    range(1, 16),
+                    weights=[1, 3, 8, 12, 15, 15, 12, 8, 5, 4, 3, 2, 2, 1, 1]
+                )[0]
+                
+                selected_products = random.sample(
+                    store_products, 
+                    min(num_items, len(store_products))
+                )
+                
+                order_items = []
+                subtotal = 0.0
+                
+                for store_product_id, parent_product_id, price in selected_products:
+                    quantity = random.choices([1, 2, 3, 4, 5], weights=[50, 30, 12, 5, 3])[0]
+                    item_total = round(price * quantity, 2)
+                    subtotal += item_total
+                    
+                    order_items.append(OrderItem(
+                        order_item_id=str(uuid.uuid4()),
+                        order_id=order_id,
+                        store_product_id=store_product_id,
+                        parent_product_id=parent_product_id,
+                        quantity=quantity,
+                        unit_price=price,
+                        total_price=item_total,
+                    ))
+                
+                subtotal = round(subtotal, 2)
+                delivery_fee = self._get_delivery_fee(subtotal, is_premium)
+                tax = round(subtotal * self.TAX_RATE, 2)
+                
+                # Add 0-30 minutes to base time for orders in same cluster
+                created_at = base_time + timedelta(minutes=random.randint(0, 30))
+                
+                # For clustered orders, bias towards pending/confirmed status
+                status = random.choices(
+                    [OrderStatus.PENDING, OrderStatus.CONFIRMED, OrderStatus.PICKING, 
+                     OrderStatus.OUT_FOR_DELIVERY, OrderStatus.DELIVERED],
+                    weights=[0.30, 0.40, 0.05, 0.05, 0.20]  # More pending/confirmed for bundling
+                )[0]
+                
+                tip = self._calculate_tip(subtotal, status)
+                total = round(subtotal + tax + delivery_fee + tip, 2)
+                
+                confirmed_at, picked_at, picking_completed_at, delivered_at = self._generate_timestamps(
+                    status, created_at
+                )
+                
+                order = Order(
+                    order_id=order_id,
+                    customer_id=customer_id,
+                    store_id=store_id,
+                    status=status,
+                    subtotal=subtotal,
+                    tax=tax,
+                    delivery_fee=delivery_fee,
+                    tip=tip,
+                    total=total,
+                    created_at=created_at,
+                    confirmed_at=confirmed_at,
+                    picked_at=picked_at,
+                    picking_completed_at=picking_completed_at,
+                    delivered_at=delivered_at,
+                    delivery_latitude=customer_lat,
+                    delivery_longitude=customer_lon,
+                    delivery_notes=self._generate_delivery_note(),
+                )
+                
+                orders.append(order)
+                all_items.extend(order_items)
+            
+            remaining -= cluster_size
+            
+            if len(orders) % 100 == 0:
+                print(f"Generated {len(orders)}/{count} orders (with clustering)...")
         
         return orders, all_items
     
@@ -290,8 +525,8 @@ class OrderGenerator(BaseGenerator):
                 INSERT INTO orders 
                 (order_id, customer_id, store_id, status, subtotal, tax,
                  delivery_fee, tip, total, created_at, confirmed_at, picked_at,
-                 delivered_at, delivery_latitude, delivery_longitude, delivery_notes)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 picking_completed_at, delivered_at, delivery_latitude, delivery_longitude, delivery_notes)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 [
                     (o.order_id, o.customer_id, o.store_id, o.status.value,
@@ -299,6 +534,7 @@ class OrderGenerator(BaseGenerator):
                      o.created_at.isoformat(),
                      o.confirmed_at.isoformat() if o.confirmed_at else None,
                      o.picked_at.isoformat() if o.picked_at else None,
+                     o.picking_completed_at.isoformat() if o.picking_completed_at else None,
                      o.delivered_at.isoformat() if o.delivered_at else None,
                      o.delivery_latitude, o.delivery_longitude, o.delivery_notes)
                     for o in orders

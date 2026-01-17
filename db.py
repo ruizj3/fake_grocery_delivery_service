@@ -144,10 +144,13 @@ def init_database(reset: bool = False):
             created_at TIMESTAMP NOT NULL,
             confirmed_at TIMESTAMP,
             picked_at TIMESTAMP,
+            picking_completed_at TIMESTAMP,
             delivered_at TIMESTAMP,
             delivery_latitude REAL NOT NULL,
             delivery_longitude REAL NOT NULL,
             delivery_notes TEXT,
+            prediction_sent BOOLEAN DEFAULT FALSE,
+            prediction_sent_at TIMESTAMP,
             FOREIGN KEY (customer_id) REFERENCES customers(customer_id),
             FOREIGN KEY (store_id) REFERENCES stores(store_id)
         )
@@ -169,6 +172,38 @@ def init_database(reset: bool = False):
         )
     """)
     
+    # Bundles table
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS bundles (
+            bundle_id TEXT PRIMARY KEY,
+            driver_id TEXT,
+            status TEXT NOT NULL,
+            created_at TIMESTAMP NOT NULL,
+            assigned_at TIMESTAMP,
+            picked_up_at TIMESTAMP,
+            completed_at TIMESTAMP,
+            total_distance_km REAL,
+            estimated_duration_min INTEGER,
+            order_count INTEGER DEFAULT 0,
+            total_value REAL DEFAULT 0,
+            centroid_latitude REAL,
+            centroid_longitude REAL,
+            FOREIGN KEY (driver_id) REFERENCES drivers(driver_id)
+        )
+    """)
+    
+    # Bundle stops table
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS bundle_stops (
+            id TEXT PRIMARY KEY,
+            bundle_id TEXT NOT NULL,
+            order_id TEXT NOT NULL,
+            stop_sequence INTEGER NOT NULL,
+            FOREIGN KEY (bundle_id) REFERENCES bundles(bundle_id),
+            FOREIGN KEY (order_id) REFERENCES orders(order_id)
+        )
+    """)
+    
     # Create indexes for common queries
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_stores_city ON stores(city)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_stores_active ON stores(is_active)")
@@ -181,6 +216,10 @@ def init_database(reset: bool = False):
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_store_products_store ON store_products(store_id)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_store_products_parent ON store_products(parent_product_id)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_parent_products_category ON parent_products(category)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_bundles_driver ON bundles(driver_id)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_bundles_status ON bundles(status)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_bundle_stops_bundle ON bundle_stops(bundle_id)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_bundle_stops_order ON bundle_stops(order_id)")
     
     conn.commit()
     conn.close()

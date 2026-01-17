@@ -12,10 +12,13 @@ Made with help from Copilot and Claude Sonnet 4.5.
 - Drivers: Every 5 minutes (default)
 - Stores: Every 10 minutes (default)
 - Bundles: Every 60 seconds (default)
+- Predictions: Every 30 seconds (default)
 
 ⚡ **Independent Control**: Start/stop each generator independently
 🎛️ **Dynamic Configuration**: Update intervals without restarting
 🏪 **Store Hierarchy**: Stores with location-specific inventory and pricing
+❌ **Order Cancellations**: Realistic cancellation behavior with decreasing probability
+🤖 **ML Integration**: Automatic prediction service integration for confirmed orders
 📊 **Real-time API**: Live data streaming for ML experimentation
 
 ## Quick Start
@@ -50,7 +53,7 @@ open http://localhost:8000/docs
 
 | Method | Endpoint | Description |
 |--------|----------|-------------|
-| POST | `/services/start-all` | Start all generators (orders, customers, drivers, stores, bundles) |
+| POST | `/services/start-all` | Start all generators (orders, customers, drivers, stores, bundles, predictions) |
 | POST | `/services/stop-all` | Stop all background services |
 | POST | `/services/orders/start` | Start automatic order generation |
 | POST | `/services/orders/stop` | Stop order generation |
@@ -62,6 +65,8 @@ open http://localhost:8000/docs
 | POST | `/services/stores/stop` | Stop store generation |
 | POST | `/services/bundles/start` | Start periodic bundling |
 | POST | `/services/bundles/stop` | Stop bundling |
+| POST | `/services/predictions/start` | Start automatic prediction sending |
+| POST | `/services/predictions/stop` | Stop prediction sending |
 | PATCH | `/services/config` | Update intervals |
 
 ### Data Access
@@ -85,6 +90,14 @@ open http://localhost:8000/docs
 | POST | `/bundles/process` | Process pending orders now |
 | GET | `/bundles/{id}` | Get bundle with stops |
 
+### Prediction Service
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| POST | `/predictions/send?batch_size=10` | Manually send confirmed orders to prediction service |
+
+See [PREDICTION_SERVICE.md](PREDICTION_SERVICE.md) for complete documentation.
+
 ## Usage Examples
 
 ### Start Live Data Generation
@@ -102,6 +115,8 @@ curl -X POST http://localhost:8000/services/start-all
 # - Drivers generated every ~300s (5 min)
 # - Stores generated every ~600s (10 min)
 # - Bundles processed every ~60s
+# - Orders progressing through lifecycle (picking → delivery)
+# - Random order cancellations at various stages
 ```
 
 ### Configure Generation Speed
@@ -288,13 +303,44 @@ store_products → parent_product_id → parent_products
 
 ```
 [pending] → [confirmed] → [picking] → [out_for_delivery] → [delivered]
+    ↓           ↓             ↓                ↓
+    └───────────┴─────────────┴────────────────→ [canceled]
 ```
+
+**Status Flow:**
+1. **pending**: Order placed, awaiting confirmation (`created_at` set)
+2. **confirmed**: Order confirmed, waiting to be bundled and picked (`confirmed_at` set)
+3. **picking**: Shopper is gathering items from store (`picked_at` set)
+4. **out_for_delivery**: All items picked, driver en route to customer (`picking_completed_at` set)
+5. **delivered**: Order successfully delivered (`delivered_at` set)
+6. **canceled**: Order canceled (can happen at any stage before delivery)
+
+**Timestamps:**
+- `created_at`: Order placed
+- `confirmed_at`: Order confirmed (typically 1-5 minutes after creation)
+- `picked_at`: Picking started (shopper begins gathering items)
+- `picking_completed_at`: Picking finished (all items gathered, ready for delivery)
+- `delivered_at`: Order delivered to customer
+
+**Cancellation Behavior:**
+
+Orders can be canceled at any point before delivery, with decreasing probability as they progress:
+- **Pending stage** (40% of cancellations): Canceled before confirmation
+- **Confirmed stage** (30%): Canceled after confirmation but before picking starts
+- **Picking stage** (20%): Canceled while shopper is gathering items
+- **Out for delivery stage** (10%): Rare late cancellation during delivery
+
+Canceled orders have:
+- Timestamps only up to their cancellation point
+- $0.00 tip (no tip charged for canceled orders)
+- Status set to `canceled`
 
 **Bundling Process:**
 1. Orders start in `pending` or `confirmed` status
 2. The bundling service groups nearby orders from the same store
 3. The bundling service assigns an available driver to each bundle
-4. Orders are picked, delivered as a bundle, and marked `delivered`
+4. Orders transition through picking → out_for_delivery → delivered
+5. Background simulator may randomly cancel orders at any stage
 
 **Key Point:** Drivers are assigned to bundles (groups of orders), not to individual orders. The bundling service finds the best available driver based on proximity to the bundle's centroid.
 

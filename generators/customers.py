@@ -1,7 +1,9 @@
 import uuid
 import random
+import math
 from datetime import datetime, timedelta
 from .base import BaseGenerator
+from .geofence import get_all_zones, get_zone_weights
 from models import Customer
 from db import get_cursor
 
@@ -9,21 +11,24 @@ from db import get_cursor
 class CustomerGenerator(BaseGenerator):
     def __init__(self, seed: int | None = 42):
         super().__init__(seed)
-        # Simulate customers clustered around a few metro areas
-        self.metro_centers = [
-            {"city": "San Francisco", "state": "CA", "lat": 37.7749, "lon": -122.4194},
-            {"city": "Oakland", "state": "CA", "lat": 37.8044, "lon": -122.2712},
-            {"city": "San Jose", "state": "CA", "lat": 37.3382, "lon": -121.8863},
-            {"city": "Berkeley", "state": "CA", "lat": 37.8716, "lon": -122.2727},
-            {"city": "Palo Alto", "state": "CA", "lat": 37.4419, "lon": -122.1430},
-        ]
+        # Use geofenced delivery zones
+        self.delivery_zones = get_all_zones()
     
     def generate_one(self) -> Customer:
-        metro = random.choice(self.metro_centers)
+        # Select zone based on weights
+        zone = random.choices(self.delivery_zones, weights=get_zone_weights())[0]
         
-        # Add some variance to location within metro area
-        lat = metro["lat"] + random.uniform(-0.05, 0.05)
-        lon = metro["lon"] + random.uniform(-0.05, 0.05)
+        # Generate random point within zone's radius (using polar coordinates for uniform distribution)
+        # This ensures customers are evenly distributed within the circular geofence
+        r = zone["radius_km"] * math.sqrt(random.random())  # sqrt for uniform distribution
+        theta = random.uniform(0, 2 * math.pi)
+        
+        # Convert to lat/lon offset (approximate for small distances)
+        lat_offset = (r * math.cos(theta)) / 111.0  # 1 degree lat ≈ 111 km
+        lon_offset = (r * math.sin(theta)) / (111.0 * math.cos(math.radians(zone["lat"])))
+        
+        lat = zone["lat"] + lat_offset
+        lon = zone["lon"] + lon_offset
         
         # Random signup date within last 2 years
         days_ago = random.randint(0, 730)
@@ -36,9 +41,9 @@ class CustomerGenerator(BaseGenerator):
             email=self.fake.unique.email(),
             phone=self.fake.phone_number(),
             address=self.fake.street_address(),
-            city=metro["city"],
-            state=metro["state"],
-            zip_code=self.fake.zipcode_in_state(metro["state"]),
+            city=zone["city"],
+            state=zone["state"],
+            zip_code=self.fake.zipcode_in_state(zone["state"]),
             latitude=lat,
             longitude=lon,
             created_at=created_at,

@@ -38,19 +38,55 @@ class ServiceStatus(BaseModel):
     order_generation_active: bool
     bundle_processing_active: bool
     delivery_simulation_active: bool
+    prediction_sending_active: bool
     customer_generation_active: bool
     driver_generation_active: bool
     store_generation_active: bool
     order_interval_seconds: float
     bundle_interval_seconds: float
+    prediction_interval_seconds: float
     customer_interval_seconds: float
     driver_interval_seconds: float
     store_interval_seconds: float
 
 
+class PredictionOrder(BaseModel):
+    order_id: str
+    customer_id: str
+    store_id: str
+    store_latitude: float
+    store_longitude: float
+    delivery_latitude: float
+    delivery_longitude: float
+    total: int  # in cents
+    quantity: int
+    created_at: str
+
+
+class PredictionBatchRequest(BaseModel):
+    orders: list[PredictionOrder]
+
+
+class PredictionResult(BaseModel):
+    success: bool
+    status_code: int | None = None
+    data: dict | None = None
+    error: str | None = None
+    orders_sent: int
+
+
+class PredictionResponse(BaseModel):
+    total_orders: int
+    batches_sent: int
+    successful_batches: int
+    failed_batches: int
+    results: list[PredictionResult]
+
+
 class ConfigUpdate(BaseModel):
     order_interval_seconds: float | None = None
     bundle_interval_seconds: float | None = None
+    prediction_interval_seconds: float | None = None
     customer_interval_seconds: float | None = None
     driver_interval_seconds: float | None = None
     store_interval_seconds: float | None = None
