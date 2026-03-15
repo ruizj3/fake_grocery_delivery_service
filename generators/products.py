@@ -3,7 +3,7 @@ import random
 from dataclasses import dataclass
 from .base import BaseGenerator
 from models import ProductCategory
-from db import get_cursor
+from database.db import get_cursor
 
 
 @dataclass
@@ -382,15 +382,17 @@ class ProductGenerator(BaseGenerator):
         self.save_parent_products_to_db(records)
     
     def get_store_available_products(self, store_id: str) -> list[tuple]:
-        """Returns (store_product_id, parent_product_id, price) for available products at store."""
+        """Returns (store_product_id, parent_product_id, price, category, is_organic) for available products at store."""
         with get_cursor() as cursor:
             cursor.execute(
-                """SELECT store_product_id, parent_product_id, price 
-                   FROM store_products 
-                   WHERE store_id = ? AND is_available = 1""",
+                """SELECT sp.store_product_id, sp.parent_product_id, sp.price,
+                          pp.category, pp.is_organic
+                   FROM store_products sp
+                   JOIN parent_products pp ON sp.parent_product_id = pp.parent_product_id
+                   WHERE sp.store_id = ? AND sp.is_available = 1""",
                 (store_id,)
             )
-            return [(row[0], row[1], row[2]) for row in cursor.fetchall()]
+            return [(row[0], row[1], row[2], row[3], row[4]) for row in cursor.fetchall()]
     
     def get_all_parent_products(self) -> list[ParentProduct]:
         """Load all parent products from database."""

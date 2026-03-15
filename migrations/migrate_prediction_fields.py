@@ -4,7 +4,7 @@ Migration script to add prediction tracking fields to orders table
 import sqlite3
 from pathlib import Path
 
-DATABASE_PATH = Path(__file__).parent / "database" / "grocery_delivery.db"
+DATABASE_PATH = Path(__file__).parent.parent / "database" / "grocery_delivery.db"
 
 def migrate():
     """Add prediction_sent and prediction_sent_at fields to orders table"""

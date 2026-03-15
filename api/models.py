@@ -90,3 +90,35 @@ class ConfigUpdate(BaseModel):
     customer_interval_seconds: float | None = None
     driver_interval_seconds: float | None = None
     store_interval_seconds: float | None = None
+
+
+class SimulationConfigUpdate(BaseModel):
+    """Update simulation parameters for deterministic replay.
+    
+    Set master_seed + deterministic_mode=true to enable full replay:
+    the same seed produces the exact same sequence of events.
+    """
+    master_seed: int | None = None
+    deterministic_mode: bool | None = None
+    
+    # Arrival rates (Poisson λ)
+    order_arrival_rate_per_min: float | None = None
+    customer_arrival_rate_per_min: float | None = None
+    driver_arrival_rate_per_min: float | None = None
+    
+    # Latency (Gaussian parameters)
+    confirmation_delay_mean_sec: float | None = None
+    confirmation_delay_std_sec: float | None = None
+    picking_duration_mean_min: float | None = None
+    picking_duration_std_min: float | None = None
+    transit_speed_mean_kmh: float | None = None
+    transit_speed_std_kmh: float | None = None
+    
+    # Error / cancellation rates (uniform threshold)
+    cancellation_rate_pending: float | None = None
+    cancellation_rate_confirmed: float | None = None
+    cancellation_rate_picking: float | None = None
+    cancellation_rate_delivery: float | None = None
+    api_error_rate: float | None = None
+    api_error_delay_mean_ms: float | None = None
+    api_error_delay_std_ms: float | None = None

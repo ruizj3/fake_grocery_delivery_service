@@ -14,7 +14,7 @@ import asyncio
 import random
 from datetime import datetime
 
-from db import init_database, get_table_counts
+from database.db import init_database, get_table_counts
 from generators import (
     CustomerGenerator,
     DriverGenerator,
@@ -22,8 +22,10 @@ from generators import (
     StoreGenerator,
     OrderGenerator,
 )
+from generators.base import get_simulation_config, set_simulation_config
 from services import BundlingService
 from services.predictions import PredictionService
+from simulation import SimulationConfig, SimulationRNG
 from api.models import (
     GenerationResponse,
     OrderResponse,
@@ -32,6 +34,7 @@ from api.models import (
     ConfigUpdate,
     ServiceStatus,
     PredictionResponse,
+    SimulationConfigUpdate,
 )
 
 
@@ -46,7 +49,11 @@ class AppState:
         self.store_generation_active = False
         self.prediction_sending_active = False
         
-        # Generation intervals
+        # Simulation config (deterministic seeding)
+        self.sim_config = SimulationConfig(deterministic_mode=False)  # API default: non-deterministic
+        self.sim_rng = SimulationRNG(seed=None, namespace="api")
+        
+        # Generation intervals (will be overridden by Poisson arrivals when deterministic)
         self.order_interval_seconds = 10.0  # New order every N seconds
         self.bundle_interval_seconds = 60.0  # Process bundles every N seconds
         self.customer_interval_seconds = 120.0  # New customers every N seconds
@@ -75,31 +82,36 @@ class AppState:
     @property
     def customer_gen(self):
         if not self._customer_gen:
-            self._customer_gen = CustomerGenerator(seed=None)  # No seed = random
+            seed = self.sim_config.derive_seed("customers") if self.sim_config.deterministic_mode else None
+            self._customer_gen = CustomerGenerator(seed=seed)
         return self._customer_gen
     
     @property
     def driver_gen(self):
         if not self._driver_gen:
-            self._driver_gen = DriverGenerator(seed=None)
+            seed = self.sim_config.derive_seed("drivers") if self.sim_config.deterministic_mode else None
+            self._driver_gen = DriverGenerator(seed=seed)
         return self._driver_gen
     
     @property
     def product_gen(self):
         if not self._product_gen:
-            self._product_gen = ProductGenerator(seed=None)
+            seed = self.sim_config.derive_seed("products") if self.sim_config.deterministic_mode else None
+            self._product_gen = ProductGenerator(seed=seed)
         return self._product_gen
     
     @property
     def store_gen(self):
         if not self._store_gen:
-            self._store_gen = StoreGenerator(seed=None)
+            seed = self.sim_config.derive_seed("stores") if self.sim_config.deterministic_mode else None
+            self._store_gen = StoreGenerator(seed=seed)
         return self._store_gen
     
     @property
     def order_gen(self):
         if not self._order_gen:
-            self._order_gen = OrderGenerator(seed=None)
+            seed = self.sim_config.derive_seed("orders") if self.sim_config.deterministic_mode else None
+            self._order_gen = OrderGenerator(seed=seed)
         return self._order_gen
     
     @property
@@ -136,14 +148,38 @@ async def request_prediction_for_orders(order_ids: list[str]):
 
 
 async def random_order_generator():
-    """Background task: generates orders at random intervals."""
+    """Background task: generates orders using Poisson process inter-arrival times.
+    
+    When deterministic_mode is enabled, uses exponential distribution (Poisson process)
+    for realistic inter-arrival times controlled by the simulation seed.
+    Otherwise falls back to uniform jitter around the configured interval.
+    """
     while state.order_generation_active:
         try:
-            # Add some randomness to interval
-            jitter = random.uniform(0.5, 1.5)
-            await asyncio.sleep(state.order_interval_seconds * jitter)
+            # Poisson process: exponential inter-arrival time
+            if state.sim_config.deterministic_mode:
+                wait_seconds = state.sim_rng.exponential_wait(
+                    rate_per_min=state.sim_config.order_arrival_rate_per_min
+                )
+            else:
+                # Legacy behavior: uniform jitter around interval
+                jitter = random.uniform(0.5, 1.5)
+                wait_seconds = state.order_interval_seconds * jitter
+            
+            await asyncio.sleep(wait_seconds)
             
             if state.order_generation_active:
+                # Simulated API error injection
+                if state.sim_rng.should_trigger(state.sim_config.api_error_rate):
+                    error_delay_ms = state.sim_rng.gaussian(
+                        mean=state.sim_config.api_error_delay_mean_ms,
+                        std=state.sim_config.api_error_delay_std_ms,
+                        minimum=100.0
+                    )
+                    await asyncio.sleep(error_delay_ms / 1000.0)
+                    print(f"[{datetime.now().strftime('%H:%M:%S')}] ⚠️  Simulated order generation error (HTTP 500, {error_delay_ms:.0f}ms delay)")
+                    continue
+                
                 order, items = state.order_gen.generate_one()
                 confirmed_order_ids = state.order_gen.save_to_db(([order], items))
                 print(f"[{datetime.now().strftime('%H:%M:%S')}] Generated order {order.order_id[:8]}... (${order.total:.2f})")
@@ -173,7 +209,7 @@ async def periodic_bundle_processor():
                     
                     # Mark orders as "picking" with picked_at timestamp
                     # Also set assigned_at for bundles with drivers
-                    from db import get_cursor
+                    from database.db import get_cursor
                     from datetime import timedelta
                     import random
                     with get_cursor() as cursor:
@@ -206,7 +242,7 @@ async def periodic_bundle_processor():
 
 async def delivery_simulator():
     """Background task: simulates order delivery progression with realistic timestamps."""
-    from db import get_cursor
+    from database.db import get_cursor
     
     while state.delivery_simulation_active:
         try:
@@ -331,8 +367,12 @@ async def delivery_simulator():
 
 
 async def order_cancellation_simulator():
-    """Background task: randomly cancels orders at different lifecycle stages with decreasing probability."""
-    from db import get_cursor
+    """Background task: randomly cancels orders at different lifecycle stages with decreasing probability.
+    
+    Cancellation rates are configurable via SimulationConfig and use the seeded
+    RNG for deterministic replay when in deterministic_mode.
+    """
+    from database.db import get_cursor
     
     while state.delivery_simulation_active:  # Shares same activation flag as delivery
         try:
@@ -342,7 +382,7 @@ async def order_cancellation_simulator():
                 break
             
             with get_cursor() as cursor:
-                # Pending orders: 4% cancellation rate (highest)
+                # Pending orders: configurable cancellation rate (default 4%)
                 cursor.execute("""
                     SELECT order_id FROM orders 
                     WHERE status = 'pending'
@@ -351,14 +391,14 @@ async def order_cancellation_simulator():
                 pending_orders = cursor.fetchall()
                 
                 for (order_id,) in pending_orders:
-                    if random.random() < 0.04:  # 4% chance
+                    if state.sim_rng.should_trigger(state.sim_config.cancellation_rate_pending):
                         cursor.execute(
                             "UPDATE orders SET status = 'canceled' WHERE order_id = ?",
                             (order_id,)
                         )
                         print(f"[{datetime.now().strftime('%H:%M:%S')}] Canceled order {order_id[:8]}... (pending stage)")
                 
-                # Confirmed orders: 3% cancellation rate
+                # Confirmed orders: configurable cancellation rate (default 3%)
                 cursor.execute("""
                     SELECT order_id FROM orders 
                     WHERE status = 'confirmed'
@@ -367,14 +407,14 @@ async def order_cancellation_simulator():
                 confirmed_orders = cursor.fetchall()
                 
                 for (order_id,) in confirmed_orders:
-                    if random.random() < 0.03:  # 3% chance
+                    if state.sim_rng.should_trigger(state.sim_config.cancellation_rate_confirmed):
                         cursor.execute(
                             "UPDATE orders SET status = 'canceled' WHERE order_id = ?",
                             (order_id,)
                         )
                         print(f"[{datetime.now().strftime('%H:%M:%S')}] Canceled order {order_id[:8]}... (confirmed stage)")
                 
-                # Picking orders: 2% cancellation rate
+                # Picking orders: configurable cancellation rate (default 2%)
                 cursor.execute("""
                     SELECT order_id FROM orders 
                     WHERE status = 'picking'
@@ -383,14 +423,14 @@ async def order_cancellation_simulator():
                 picking_orders = cursor.fetchall()
                 
                 for (order_id,) in picking_orders:
-                    if random.random() < 0.02:  # 2% chance
+                    if state.sim_rng.should_trigger(state.sim_config.cancellation_rate_picking):
                         cursor.execute(
                             "UPDATE orders SET status = 'canceled' WHERE order_id = ?",
                             (order_id,)
                         )
                         print(f"[{datetime.now().strftime('%H:%M:%S')}] Canceled order {order_id[:8]}... (picking stage)")
                 
-                # Out for delivery orders: 1% cancellation rate (lowest, rare)
+                # Out for delivery orders: configurable cancellation rate (default 1%)
                 cursor.execute("""
                     SELECT order_id FROM orders 
                     WHERE status = 'out_for_delivery'
@@ -399,7 +439,7 @@ async def order_cancellation_simulator():
                 delivery_orders = cursor.fetchall()
                 
                 for (order_id,) in delivery_orders:
-                    if random.random() < 0.01:  # 1% chance
+                    if state.sim_rng.should_trigger(state.sim_config.cancellation_rate_delivery):
                         cursor.execute(
                             "UPDATE orders SET status = 'canceled' WHERE order_id = ?",
                             (order_id,)
@@ -433,15 +473,22 @@ async def automatic_prediction_sender():
 
 
 async def random_customer_generator():
-    """Background task: generates customers at random intervals."""
+    """Background task: generates customers using Poisson inter-arrival times."""
     while state.customer_generation_active:
         try:
-            jitter = random.uniform(0.8, 1.2)
-            await asyncio.sleep(state.customer_interval_seconds * jitter)
+            if state.sim_config.deterministic_mode:
+                wait_seconds = state.sim_rng.exponential_wait(
+                    rate_per_min=state.sim_config.customer_arrival_rate_per_min
+                )
+            else:
+                jitter = random.uniform(0.8, 1.2)
+                wait_seconds = state.customer_interval_seconds * jitter
+            
+            await asyncio.sleep(wait_seconds)
             
             if state.customer_generation_active:
                 # Generate 1-3 customers at a time
-                count = random.randint(1, 3)
+                count = state.sim_rng.uniform_int(1, 3)
                 customers = state.customer_gen.generate_batch(count)
                 state.customer_gen.save_to_db(customers)
                 print(f"[{datetime.now().strftime('%H:%M:%S')}] Generated {count} new customer(s)")
@@ -451,15 +498,22 @@ async def random_customer_generator():
 
 
 async def random_driver_generator():
-    """Background task: generates drivers at random intervals."""
+    """Background task: generates drivers using Poisson inter-arrival times."""
     while state.driver_generation_active:
         try:
-            jitter = random.uniform(0.8, 1.2)
-            await asyncio.sleep(state.driver_interval_seconds * jitter)
+            if state.sim_config.deterministic_mode:
+                wait_seconds = state.sim_rng.exponential_wait(
+                    rate_per_min=state.sim_config.driver_arrival_rate_per_min
+                )
+            else:
+                jitter = random.uniform(0.8, 1.2)
+                wait_seconds = state.driver_interval_seconds * jitter
+            
+            await asyncio.sleep(wait_seconds)
             
             if state.driver_generation_active:
                 # Generate 1-2 drivers at a time
-                count = random.randint(1, 2)
+                count = state.sim_rng.uniform_int(1, 2)
                 drivers = state.driver_gen.generate_batch(count)
                 state.driver_gen.save_to_db(drivers)
                 print(f"[{datetime.now().strftime('%H:%M:%S')}] Generated {count} new driver(s)")
@@ -630,7 +684,7 @@ async def generate_customers(count: int = Query(default=1, ge=1, le=100)):
 @app.get("/customers", tags=["Customers"])
 async def list_customers(limit: int = 20, offset: int = 0):
     """List customers with pagination."""
-    from db import get_cursor
+    from database.db import get_cursor
     with get_cursor() as cursor:
         cursor.execute(
             "SELECT * FROM customers ORDER BY created_at DESC LIMIT ? OFFSET ?",
@@ -643,7 +697,7 @@ async def list_customers(limit: int = 20, offset: int = 0):
 @app.get("/customers/{customer_id}", tags=["Customers"])
 async def get_customer(customer_id: str):
     """Get a specific customer."""
-    from db import get_cursor
+    from database.db import get_cursor
     with get_cursor() as cursor:
         cursor.execute("SELECT * FROM customers WHERE customer_id = ?", (customer_id,))
         row = cursor.fetchone()
@@ -671,7 +725,7 @@ async def generate_drivers(count: int = Query(default=1, ge=1, le=50)):
 @app.get("/drivers", tags=["Drivers"])
 async def list_drivers(limit: int = 20, offset: int = 0, active_only: bool = False):
     """List drivers with pagination."""
-    from db import get_cursor
+    from database.db import get_cursor
     query = "SELECT * FROM drivers"
     if active_only:
         query += " WHERE is_active = 1"
@@ -686,7 +740,7 @@ async def list_drivers(limit: int = 20, offset: int = 0, active_only: bool = Fal
 @app.get("/drivers/{driver_id}", tags=["Drivers"])
 async def get_driver(driver_id: str):
     """Get a specific driver."""
-    from db import get_cursor
+    from database.db import get_cursor
     with get_cursor() as cursor:
         cursor.execute("SELECT * FROM drivers WHERE driver_id = ?", (driver_id,))
         row = cursor.fetchone()
@@ -698,7 +752,7 @@ async def get_driver(driver_id: str):
 @app.patch("/drivers/{driver_id}/toggle", tags=["Drivers"])
 async def toggle_driver_status(driver_id: str):
     """Toggle driver active status."""
-    from db import get_cursor
+    from database.db import get_cursor
     with get_cursor() as cursor:
         cursor.execute("SELECT is_active FROM drivers WHERE driver_id = ?", (driver_id,))
         row = cursor.fetchone()
@@ -738,7 +792,7 @@ async def generate_stores(count: int = Query(default=1, ge=1, le=20)):
 @app.get("/stores", tags=["Stores"])
 async def list_stores(limit: int = 20, offset: int = 0, active_only: bool = False):
     """List stores with pagination."""
-    from db import get_cursor
+    from database.db import get_cursor
     query = "SELECT * FROM stores"
     if active_only:
         query += " WHERE is_active = 1"
@@ -753,7 +807,7 @@ async def list_stores(limit: int = 20, offset: int = 0, active_only: bool = Fals
 @app.get("/stores/{store_id}", tags=["Stores"])
 async def get_store(store_id: str):
     """Get a specific store with product count."""
-    from db import get_cursor
+    from database.db import get_cursor
     with get_cursor() as cursor:
         cursor.execute("SELECT * FROM stores WHERE store_id = ?", (store_id,))
         row = cursor.fetchone()
@@ -781,7 +835,7 @@ async def get_store_products(
     available_only: bool = True,
 ):
     """Get products available at a specific store."""
-    from db import get_cursor
+    from database.db import get_cursor
     
     query = """
         SELECT sp.*, pp.name, pp.category, pp.brand, pp.unit, pp.weight_oz, pp.is_organic
@@ -809,7 +863,7 @@ async def get_store_products(
 @app.post("/stores/{store_id}/restock", tags=["Stores"])
 async def restock_store(store_id: str):
     """Regenerate inventory for a store (restock with different availability)."""
-    from db import get_cursor
+    from database.db import get_cursor
     
     # Verify store exists
     with get_cursor() as cursor:
@@ -852,7 +906,7 @@ async def generate_product_catalog():
     # Regenerate inventory for all stores
     store_ids = state.store_gen.get_all_ids()
     for store_id in store_ids:
-        from db import get_cursor
+        from database.db import get_cursor
         with get_cursor() as cursor:
             cursor.execute("DELETE FROM store_products WHERE store_id = ?", (store_id,))
         inventory = state.product_gen.generate_store_inventory(store_id)
@@ -872,7 +926,7 @@ async def list_products(
     category: str | None = None,
 ):
     """List parent products (canonical product catalog)."""
-    from db import get_cursor
+    from database.db import get_cursor
     query = "SELECT * FROM parent_products WHERE 1=1"
     params = []
     
@@ -892,7 +946,7 @@ async def list_products(
 @app.get("/products/categories", tags=["Products"])
 async def list_categories():
     """List all product categories with counts."""
-    from db import get_cursor
+    from database.db import get_cursor
     with get_cursor() as cursor:
         cursor.execute(
             "SELECT category, COUNT(*) as count FROM parent_products GROUP BY category ORDER BY category"
@@ -947,7 +1001,7 @@ async def list_orders(
     status: str | None = None,
 ):
     """List orders with optional status filter."""
-    from db import get_cursor
+    from database.db import get_cursor
     query = "SELECT * FROM orders"
     params = []
     
@@ -967,7 +1021,7 @@ async def list_orders(
 @app.get("/orders/queue", tags=["Orders"])
 async def get_order_queue():
     """Get orders waiting to be bundled (pending/confirmed)."""
-    from db import get_cursor
+    from database.db import get_cursor
     with get_cursor() as cursor:
         cursor.execute(
             """SELECT * FROM orders 
@@ -984,7 +1038,7 @@ async def get_order_queue():
 @app.get("/orders/{order_id}", tags=["Orders"])
 async def get_order(order_id: str):
     """Get order details with items."""
-    from db import get_cursor
+    from database.db import get_cursor
     with get_cursor() as cursor:
         cursor.execute("SELECT * FROM orders WHERE order_id = ?", (order_id,))
         order = cursor.fetchone()
@@ -1020,7 +1074,7 @@ async def send_predictions(batch_size: int = Query(10, description="Number of or
 @app.get("/predictions/status", tags=["Predictions"])
 async def get_prediction_status():
     """Get statistics about prediction coverage for confirmed orders."""
-    from db import get_cursor
+    from database.db import get_cursor
     with get_cursor() as cursor:
         cursor.execute("""
             SELECT 
@@ -1066,7 +1120,7 @@ async def process_bundles_now():
     state.bundle_service.save_bundles_to_db(bundles)
     
     # Update order statuses
-    from db import get_cursor
+    from database.db import get_cursor
     with get_cursor() as cursor:
         for bundle in bundles:
             for stop in bundle.stops:
@@ -1089,7 +1143,7 @@ async def process_bundles_now():
 @app.get("/bundles", tags=["Bundles"])
 async def list_bundles(limit: int = 20, offset: int = 0):
     """List bundles with pagination."""
-    from db import get_cursor
+    from database.db import get_cursor
     with get_cursor() as cursor:
         cursor.execute(
             "SELECT * FROM bundles ORDER BY created_at DESC LIMIT ? OFFSET ?",
@@ -1102,7 +1156,7 @@ async def list_bundles(limit: int = 20, offset: int = 0):
 @app.get("/bundles/{bundle_id}", tags=["Bundles"])
 async def get_bundle(bundle_id: str):
     """Get bundle details with stops."""
-    from db import get_cursor
+    from database.db import get_cursor
     with get_cursor() as cursor:
         cursor.execute("SELECT * FROM bundles WHERE bundle_id = ?", (bundle_id,))
         bundle = cursor.fetchone()
@@ -1385,6 +1439,114 @@ async def update_service_config(config: ConfigUpdate):
         "driver_interval_seconds": state.driver_interval_seconds,
         "store_interval_seconds": state.store_interval_seconds,
     }
+
+
+# =============================================================================
+# Simulation Configuration
+# =============================================================================
+
+@app.get("/simulation/config", tags=["Simulation"])
+async def get_simulation_config():
+    """Get current simulation configuration."""
+    cfg = state.sim_config
+    return {
+        "master_seed": cfg.master_seed,
+        "deterministic_mode": cfg.deterministic_mode,
+        "arrival_rates": {
+            "order_per_min": cfg.order_arrival_rate_per_min,
+            "customer_per_min": cfg.customer_arrival_rate_per_min,
+            "driver_per_min": cfg.driver_arrival_rate_per_min,
+        },
+        "latency": {
+            "confirmation_delay_mean_sec": cfg.confirmation_delay_mean_sec,
+            "confirmation_delay_std_sec": cfg.confirmation_delay_std_sec,
+            "picking_duration_mean_min": cfg.picking_duration_mean_min,
+            "picking_duration_std_min": cfg.picking_duration_std_min,
+            "transit_speed_mean_kmh": cfg.transit_speed_mean_kmh,
+            "transit_speed_std_kmh": cfg.transit_speed_std_kmh,
+        },
+        "error_rates": {
+            "cancellation_pending": cfg.cancellation_rate_pending,
+            "cancellation_confirmed": cfg.cancellation_rate_confirmed,
+            "cancellation_picking": cfg.cancellation_rate_picking,
+            "cancellation_delivery": cfg.cancellation_rate_delivery,
+            "api_error_rate": cfg.api_error_rate,
+            "api_error_delay_mean_ms": cfg.api_error_delay_mean_ms,
+            "api_error_delay_std_ms": cfg.api_error_delay_std_ms,
+        },
+    }
+
+
+@app.patch("/simulation/config", tags=["Simulation"])
+async def update_simulation_config(config: SimulationConfigUpdate):
+    """Update simulation configuration.
+    
+    Changes take effect immediately for running services.
+    Setting master_seed + deterministic_mode=true enables full replay capability.
+    """
+    cfg = state.sim_config
+    
+    if config.master_seed is not None:
+        cfg.master_seed = config.master_seed
+    if config.deterministic_mode is not None:
+        cfg.deterministic_mode = config.deterministic_mode
+    if config.order_arrival_rate_per_min is not None:
+        cfg.order_arrival_rate_per_min = config.order_arrival_rate_per_min
+    if config.customer_arrival_rate_per_min is not None:
+        cfg.customer_arrival_rate_per_min = config.customer_arrival_rate_per_min
+    if config.driver_arrival_rate_per_min is not None:
+        cfg.driver_arrival_rate_per_min = config.driver_arrival_rate_per_min
+    if config.confirmation_delay_mean_sec is not None:
+        cfg.confirmation_delay_mean_sec = config.confirmation_delay_mean_sec
+    if config.confirmation_delay_std_sec is not None:
+        cfg.confirmation_delay_std_sec = config.confirmation_delay_std_sec
+    if config.picking_duration_mean_min is not None:
+        cfg.picking_duration_mean_min = config.picking_duration_mean_min
+    if config.picking_duration_std_min is not None:
+        cfg.picking_duration_std_min = config.picking_duration_std_min
+    if config.transit_speed_mean_kmh is not None:
+        cfg.transit_speed_mean_kmh = config.transit_speed_mean_kmh
+    if config.transit_speed_std_kmh is not None:
+        cfg.transit_speed_std_kmh = config.transit_speed_std_kmh
+    if config.cancellation_rate_pending is not None:
+        cfg.cancellation_rate_pending = config.cancellation_rate_pending
+    if config.cancellation_rate_confirmed is not None:
+        cfg.cancellation_rate_confirmed = config.cancellation_rate_confirmed
+    if config.cancellation_rate_picking is not None:
+        cfg.cancellation_rate_picking = config.cancellation_rate_picking
+    if config.cancellation_rate_delivery is not None:
+        cfg.cancellation_rate_delivery = config.cancellation_rate_delivery
+    if config.api_error_rate is not None:
+        cfg.api_error_rate = config.api_error_rate
+    if config.api_error_delay_mean_ms is not None:
+        cfg.api_error_delay_mean_ms = config.api_error_delay_mean_ms
+    if config.api_error_delay_std_ms is not None:
+        cfg.api_error_delay_std_ms = config.api_error_delay_std_ms
+    
+    # Re-initialize seeded RNG and generators when seed or mode changes
+    if config.master_seed is not None or config.deterministic_mode is not None:
+        if cfg.deterministic_mode:
+            state.sim_rng = SimulationRNG(seed=cfg.master_seed, namespace="api")
+            # Reset generators so they re-init with new seeds
+            state._customer_gen = None
+            state._driver_gen = None
+            state._product_gen = None
+            state._store_gen = None
+            state._order_gen = None
+            # Also update the global config used by generators
+            set_simulation_config(cfg)
+            print(f"🔒 Deterministic mode enabled (seed={cfg.master_seed})")
+        else:
+            state.sim_rng = SimulationRNG(seed=None, namespace="api")
+            state._customer_gen = None
+            state._driver_gen = None
+            state._product_gen = None
+            state._store_gen = None
+            state._order_gen = None
+            set_simulation_config(cfg)
+            print(f"🔓 Non-deterministic mode enabled")
+    
+    return await get_simulation_config()
 
 
 # =============================================================================

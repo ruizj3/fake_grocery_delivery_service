@@ -10,7 +10,7 @@ from pathlib import Path
 
 API_URL = "http://localhost:8000"
 PREDICTION_URL = "http://localhost:3000"
-DB_PATH = Path(__file__).parent / "database" / "grocery_delivery.db"
+DB_PATH = Path(__file__).parent.parent / "database" / "grocery_delivery.db"
 
 
 def test_automatic_predictions():

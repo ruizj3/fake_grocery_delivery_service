@@ -1,0 +1,49 @@
+Starting main()
+Calling load_delivery_data()
+Calling calculate_delivery_metrics()
+Merging customers
+Merging items
+Merging bundles
+Merging drivers
+Calling analyze_numeric_correlations()
+Calling analyze_categorical_features()
+  Inside analyze_categorical_features
+  Checking column: weather_condition
+    weather_condition count: 0
+  Checking column: is_peak_hour
+    is_peak_hour count: 184052
+  Checking column: is_weekend
+    is_weekend count: 184052
+  Checking column: is_premium
+    is_premium count: 184052
+  Checking column: persona
+    persona count: 184052
+  Checking column: customer_city
+    customer_city count: 184052
+  Checking column: store_city
+  Checking column: experience_level
+    experience_level count: 184052
+  Checking column: order_day_of_week
+    order_day_of_week count: 184052
+  Available cols: ['is_peak_hour', 'is_weekend', 'is_premium', 'persona', 'customer_city', 'experience_level', 'order_day_of_week']
+  Processing col: is_peak_hour
+    valid_data len: 184052
+    groupby starting
+    num groups: 1
+  Processing col: is_weekend
+    valid_data len: 184052
+    groupby starting
+    num groups: 1
+  Processing col: is_premium
+    valid_data len: 184052
+    groupby starting
+    num groups: 2
+    ANOVA starting
+    ANOVA done
+    eta done
+  Processing col: persona
+    valid_data len: 184052
+    groupby starting
+    num groups: 6
+    ANOVA starting
+    ANOVA done

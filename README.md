@@ -1,12 +1,22 @@
 # Grocery Delivery Data Generator
 
-A lightweight Python service for generating fake grocery delivery data, mimicking platforms like DoorDash or Instacart. Includes a **live FastAPI service** with automatic, continuous generation of all entities (orders, customers, drivers, stores) and periodic bundling.
+A lightweight Python service for generating **realistic, ML-ready** grocery delivery data, mimicking platforms like DoorDash or Instacart. Features **persona-based customer behavior**, **product bundles**, **weather/traffic patterns**, and **risk-based cancellations** for meaningful machine learning projects.
 
 Made with help from Copilot and Claude Sonnet 4.5.
 
 ## Key Features
 
-🔄 **Continuous Generation**: All entities generate automatically with configurable intervals
+### 🤖 **ML Realism** (NEW!)
+- **6 Customer Personas**: health_conscious, family_shopper, young_professional, budget_conscious, specialty_diet, convenience_seeker
+- **20 Product Bundles**: Realistic meal patterns (pasta_night, taco_tuesday, breakfast_essentials, etc.)
+- **Weather & Traffic**: City-specific patterns affecting delivery times and order volume
+- **Smart Cancellation Risk**: Based on traffic, order value, customer history, premium status
+- **Driver Performance**: Speed multipliers, reliability scores, experience levels
+- **Repeat Purchases**: 30-70% items from customer history based on persona
+- **Temporal Patterns**: Peak hours, weekends, preferred shopping times
+
+### 🔄 **Continuous Generation**
+All entities generate automatically with configurable intervals:
 - Orders: Every 10 seconds (default)
 - Customers: Every 2 minutes (default)
 - Drivers: Every 5 minutes (default)
@@ -14,13 +24,22 @@ Made with help from Copilot and Claude Sonnet 4.5.
 - Bundles: Every 60 seconds (default)
 - Predictions: Automatic on order confirmation (5s timeout)
 
-⚡ **Independent Control**: Start/stop each generator independently
-🎛️ **Dynamic Configuration**: Update intervals without restarting
-🏪 **Store Hierarchy**: Stores with location-specific inventory and pricing
-❌ **Order Cancellations**: Realistic cancellation behavior with decreasing probability
-🤖 **ML Integration**: Automatic prediction service integration for confirmed orders
-📊 **Real-time API**: Live data streaming for ML experimentation
-🎯 **100% Prediction Coverage**: Every confirmed order gets a delivery time estimate
+### 🎲 **Deterministic Simulation** (NEW!)
+Full replay-able simulation powered by seeded PRNG and statistical distributions:
+- **Master Seed**: Single seed controls all randomness — same seed = identical output every run
+- **Poisson Arrivals**: Order/customer/driver inter-arrival times follow exponential distribution
+- **Gaussian Latency**: Confirmation delays, picking durations, and transit times use normal distributions (mean ± std)
+- **Configurable Error Injection**: Simulate API 500 errors at a given rate with Gaussian response delays
+- **Tunable Cancellation Rates**: Per-lifecycle-stage cancellation thresholds (pending/confirmed/picking/delivery)
+- **Independent RNG Streams**: Each subsystem (orders, customers, drivers, etc.) gets its own derived seed so changes don't cascade
+
+### ⚡ **Other Features**
+- **Independent Control**: Start/stop each generator independently
+- **Dynamic Configuration**: Update intervals without restarting
+- **Store Hierarchy**: Stores with location-specific inventory and pricing
+- **Geofencing**: 6 US cities with realistic boundaries
+- **Real-time API**: Live data streaming for ML experimentation
+- **100% Prediction Coverage**: Every confirmed order gets a delivery time estimate
 
 ## Quick Start
 
@@ -30,12 +49,82 @@ python -m venv fake_grocery_venv
 source fake_grocery_venv/bin/activate
 pip install -r requirements.txt
 
+# Test ML realism features (quick validation)
+python scripts/test_ml_realism.py
+
+# Generate complete historical dataset (100K orders, 60 days, with ML features)
+python scripts/generate_complete_dataset.py --orders 100000 --days 60
+
+# OR: For large datasets (1.2M orders) - faster bundling
+python scripts/generate_complete_dataset.py --orders 1200000 --days 60 --bundle-hours 6
+
+# OR: Deterministic mode (same seed = identical dataset every time)
+python scripts/generate_complete_dataset.py --orders 100000 --days 60 --deterministic --seed 42
+
+# Verify geofencing (all data in 6 cities)
+python scripts/verify_geofencing.py
+
 # Start the API server
 uvicorn api.main:app --reload --port 8000
 
 # Open API docs
 open http://localhost:8000/docs
 ```
+
+### Deterministic Simulation (Quick Start)
+
+```bash
+# Full historical dataset: orders + customers + stores + drivers + bundles
+# Same seed = identical database every time
+python scripts/generate_complete_dataset.py --orders 100000 --days 60 --deterministic --seed 42
+
+# With simulated 5% error injection
+python scripts/generate_complete_dataset.py --orders 100000 --days 60 --deterministic --seed 42 --error-rate 0.05
+
+# Custom Poisson arrival rate (~10 orders/min)
+python scripts/generate_complete_dataset.py --orders 100000 --days 60 --deterministic --seed 42 --order-rate 10
+
+# Skip bundling if you only need raw orders
+python scripts/generate_complete_dataset.py --orders 5000 --deterministic --seed 42 --skip-bundling
+
+# Or use main.py directly for quick tests (no bundling)
+python main.py --deterministic --seed 42 --orders 5000
+```
+
+## ML Features Deep Dive
+
+### Customer Personas
+Each customer assigned a persona affecting shopping behavior:
+- **health_conscious** (15%): Organic produce, 75% organic preference, ±30% higher value
+- **family_shopper** (25%): Large carts (25 items avg), bulk quantities, pantry staples
+- **young_professional** (20%): Small frequent orders (8 items), convenience items, late hours
+- **budget_conscious** (20%): Price-sensitive, avoids organic, off-peak shopping
+- **specialty_diet** (10%): Vegan, organic, specialty items, ±40% higher value
+- **convenience_seeker** (10%): Very frequent, 70% repeat purchases, tiny carts (5 items)
+
+### Product Bundles
+20 realistic meal patterns with 60-80% co-occurrence:
+- `breakfast_essentials`, `pasta_night`, `taco_tuesday`, `salad_bowl`, `burger_night`
+- `stir_fry`, `pizza_homemade`, `smoothie_ingredients`, `bbq_party`, etc.
+- 40% of orders include 1-2 bundles aligned with persona
+
+### Environmental Factors
+- **Weather**: clear, rain, heavy_rain, snow, storm (city-specific, seasonal)
+  - Rain: +15-25% order volume, 1.25x delivery time
+  - Snow: +30% orders, 1.8x delivery time
+- **Traffic**: Rush hours (7-10am, 4-8pm) with 1.5-2.0x multipliers
+  - NYC peak: 2.0x, Seattle: 1.7x, Cincinnati: 1.5x
+  - Weekend patterns differ from weekdays
+
+### Cancellation Risk Model
+Risk-based cancellations (not random):
+- Base 5% + traffic delays (+10%) + order value (±2%) + premium (-3%) + history (+10%)
+- Realistic 5-25% range vs previous uniform 20%
+
+### Driver Performance
+- **Speed**: 0.7-1.3x (normal distribution), +experience bonus up to +20%
+- **Reliability**: Expert (95-99%), Advanced (90-96%), Intermediate (85-92%), Beginner (75-88%)
+- Correlates with ratings and total deliveries
 
 ## API Endpoints
 
@@ -69,6 +158,13 @@ open http://localhost:8000/docs
 | POST | `/services/predictions/start` | Start automatic prediction sending |
 | POST | `/services/predictions/stop` | Stop prediction sending |
 | PATCH | `/services/config` | Update intervals |
+
+### Simulation Config
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| GET | `/simulation/config` | Get current simulation parameters |
+| PATCH | `/simulation/config` | Update simulation parameters (seed, rates, error injection) |
 
 ### Data Access
 
@@ -125,6 +221,58 @@ curl -X POST http://localhost:8000/services/start-all
 # - Bundles processed every ~60s
 # - Orders progressing through lifecycle (picking → delivery)
 # - Random order cancellations at various stages
+```
+
+### Deterministic Simulation Mode
+
+Enable seeded, replay-able simulation where the same seed produces the exact same sequence of events:
+
+```bash
+# Enable deterministic mode via API
+curl -X PATCH http://localhost:8000/simulation/config \
+  -H "Content-Type: application/json" \
+  -d '{"master_seed": 1001, "deterministic_mode": true}'
+
+# Enable with 5% simulated API errors (Gaussian delay, ~500ms ± 100ms)
+curl -X PATCH http://localhost:8000/simulation/config \
+  -H "Content-Type: application/json" \
+  -d '{"master_seed": 1001, "deterministic_mode": true, "api_error_rate": 0.05}'
+
+# Tune Poisson arrival rates (orders, customers, drivers per minute)
+curl -X PATCH http://localhost:8000/simulation/config \
+  -H "Content-Type: application/json" \
+  -d '{
+    "master_seed": 1001,
+    "deterministic_mode": true,
+    "order_arrival_rate_per_min": 10.0,
+    "customer_arrival_rate_per_min": 1.0,
+    "driver_arrival_rate_per_min": 0.5
+  }'
+
+# Tune Gaussian latency distributions
+curl -X PATCH http://localhost:8000/simulation/config \
+  -H "Content-Type: application/json" \
+  -d '{
+    "confirmation_delay_mean_sec": 90,
+    "confirmation_delay_std_sec": 30,
+    "picking_duration_mean_min": 12,
+    "picking_duration_std_min": 4,
+    "transit_speed_mean_kmh": 30,
+    "transit_speed_std_kmh": 8
+  }'
+
+# Tune cancellation rates per lifecycle stage
+curl -X PATCH http://localhost:8000/simulation/config \
+  -H "Content-Type: application/json" \
+  -d '{
+    "cancellation_rate_pending": 0.06,
+    "cancellation_rate_confirmed": 0.04,
+    "cancellation_rate_picking": 0.02,
+    "cancellation_rate_delivery": 0.01
+  }'
+
+# Check current simulation config
+curl http://localhost:8000/simulation/config
 ```
 
 ### Configure Generation Speed
@@ -358,6 +506,15 @@ Canceled orders have:
 # Generate static data
 python main.py --orders 1000
 
+# Generate large historical dataset (1.2M orders over 60 days)
+python main.py --reset --orders 1200000 --days 60
+
+# Deterministic mode: same seed = identical output every run
+python main.py --deterministic --seed 42 --orders 5000
+
+# Deterministic with 5% simulated errors and custom arrival rate
+python main.py --deterministic --seed 42 --orders 5000 --error-rate 0.05 --order-rate 10
+
 # Run bundling analysis
 python main.py --bundle
 
@@ -367,6 +524,47 @@ python main.py --export
 # Reset database
 python main.py --reset
 ```
+
+### CLI Options Reference
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--orders, -n` | 500 | Number of orders to generate |
+| `--seed, -s` | 42 | Random seed for reproducibility |
+| `--days, -d` | 90 | Days of historical data |
+| `--reset, -r` | — | Reset database before generating |
+| `--deterministic` | — | Enable deterministic simulation mode |
+| `--error-rate` | 0.0 | Simulated error injection rate (0.0–1.0) |
+| `--order-rate` | 6.0 | Poisson arrival rate (orders per minute) |
+| `--export, -e` | — | Export all tables to CSV |
+| `--stats` | — | Show database statistics |
+| `--bundle` | — | Run bundling analysis |
+
+### Efficient Historical Bundling
+
+For large datasets (100K+ orders), use the optimized batch bundling script:
+
+```bash
+# Bundle all historical orders in 12-hour batches (default)
+python scripts/bundle_historical_orders.py
+
+# Faster: Use 6-hour batches
+python scripts/bundle_historical_orders.py --batch-hours 6
+
+# Skip old delivered orders (only bundle active orders)
+python scripts/bundle_historical_orders.py --skip-delivered
+
+# Only bundle recent orders (last 30 days)
+python scripts/bundle_historical_orders.py --limit-days 30
+```
+
+**Performance**: Processes ~1000-2000 orders/second, so 1.2M orders takes 10-20 minutes.
+
+**Why batch bundling?**
+- Avoids loading all orders into memory at once
+- Processes orders chronologically in time windows
+- Provides progress tracking and performance metrics
+- Commits to database in batches
 
 ## Project Structure
 
@@ -386,12 +584,28 @@ grocery-delivery-data/
 │   └── orders.py        # Order generator (with store selection)
 ├── services/
 │   ├── __init__.py
-│   └── bundling.py      # Bundle optimization service
+│   ├── bundling.py      # Bundle optimization service
+│   └── predictions.py   # Prediction service integration
+├── simulation/
+│   ├── __init__.py
+│   ├── config.py        # SimulationConfig (seed, rates, distributions)
+│   └── rng.py           # SimulationRNG (Poisson, Gaussian, uniform)
 ├── models/
 │   ├── __init__.py
 │   └── schemas.py       # Pydantic models
 ├── database/
+│   ├── db.py            # Database initialization
 │   └── grocery_delivery.db
+├── scripts/             # Utility & analysis scripts
+│   ├── analyze_data.py
+│   ├── check_order_flow.py
+│   └── verify_store_system.py
+├── tests/               # Test scripts
+│   ├── test_automatic_predictions.py
+│   └── test_prediction_service.py
+├── migrations/          # Database migrations
+│   ├── migrate_add_prediction_fields.py
+│   └── migrate_prediction_fields.py
 ├── exports/             # CSV exports
 │   ├── stores.csv
 │   ├── parent_products.csv
@@ -401,11 +615,9 @@ grocery-delivery-data/
 │   ├── orders.csv
 │   └── order_items.csv
 ├── main.py              # CLI entry point
-├── db.py                # Database initialization
 ├── requirements.txt
 ├── README.md
-├── STORE_SYSTEM.md      # Store & product hierarchy documentation
-└── verify_store_system.py  # Verification script
+└── STORE_SYSTEM.md      # Store & product hierarchy documentation
 ```
 
 ## Example Queries
@@ -585,7 +797,13 @@ while True:
 
 ## Additional Documentation
 
-- **[verify_store_system.py](verify_store_system.py)** - Script to verify store-product relationships and data integrity
+- **[GEOFENCING.md](GEOFENCING.md)** - Complete guide to city-based geofencing and optimized bundling
+- **[scripts/verify_store_system.py](scripts/verify_store_system.py)** - Script to verify store-product relationships and data integrity
+- **[scripts/analyze_data.py](scripts/analyze_data.py)** - Database analysis and statistics
+- **[scripts/check_order_flow.py](scripts/check_order_flow.py)** - Order status flow and timestamp analysis
+- **[scripts/verify_geofencing.py](scripts/verify_geofencing.py)** - Verify all data is within 6 geofenced cities
+- **[scripts/bundle_historical_orders.py](scripts/bundle_historical_orders.py)** - Efficiently bundle large historical datasets
+- **[scripts/generate_complete_dataset.py](scripts/generate_complete_dataset.py)** - One-command complete dataset generation
 
 ---
 
@@ -679,7 +897,7 @@ prediction_failed BOOLEAN DEFAULT FALSE -- Tracks failed prediction attempts
 #### 1. Migrate Existing Database
 
 ```bash
-python migrate_add_prediction_fields.py
+python migrations/migrate_add_prediction_fields.py
 ```
 
 #### 2. Start Your Prediction Service
@@ -700,7 +918,7 @@ uvicorn api.main:app --reload --port 8000
 
 ```bash
 # Run automated test
-python test_automatic_predictions.py
+python tests/test_automatic_predictions.py
 
 # Or manually create an order
 curl -X POST "http://localhost:8000/orders/generate"

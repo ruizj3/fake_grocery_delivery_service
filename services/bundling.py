@@ -14,7 +14,7 @@ routing algorithms (e.g., OR-Tools, VROOM).
 import math
 from datetime import datetime, timedelta
 from dataclasses import dataclass, field
-from db import get_cursor
+from database.db import get_cursor
 import uuid
 
 
@@ -423,12 +423,11 @@ class BundlingService:
         Only assigns drivers who are not currently on a delivery.
         Enforces same-city constraint: drivers are only assigned to bundles in their city.
         """
-        from generators.geofence import get_zone_for_coordinates
-        
         with get_cursor() as cursor:
             # Get drivers who are NOT currently on active deliveries
+            # Include city field for direct matching (no coordinate lookup needed)
             cursor.execute("""
-                SELECT DISTINCT d.driver_id, d.home_latitude, d.home_longitude, d.rating
+                SELECT DISTINCT d.driver_id, d.home_latitude, d.home_longitude, d.rating, d.city
                 FROM drivers d
                 WHERE d.is_active = 1
                 AND d.driver_id NOT IN (
@@ -448,7 +447,7 @@ class BundlingService:
             # Fallback to all active drivers if none are available
             with get_cursor() as cursor:
                 cursor.execute("""
-                    SELECT driver_id, home_latitude, home_longitude, rating
+                    SELECT driver_id, home_latitude, home_longitude, rating, city
                     FROM drivers 
                     WHERE is_active = 1
                     ORDER BY rating DESC
@@ -459,36 +458,45 @@ class BundlingService:
             print("Warning: No drivers in system. Bundles created without driver assignment.")
             return bundles
         
-        # Assign drivers to bundles (city-aware)
+        # Assign drivers to bundles (city-aware using explicit city field)
         for i, bundle in enumerate(bundles):
-            # Find closest available driver to bundle centroid IN THE SAME CITY
-            centroid_lat, centroid_lon = get_centroid(bundle.stops)
-            bundle_zone = get_zone_for_coordinates(centroid_lat, centroid_lon)
-            
-            if bundle_zone is None:
-                print(f"Warning: Bundle {bundle.bundle_id} outside all zones")
+            # Get bundle's city from first order's customer
+            if not bundle.stops:
                 continue
+                
+            # Get city from the first order in the bundle
+            with get_cursor() as cursor:
+                cursor.execute("""
+                    SELECT c.city FROM customers c
+                    JOIN orders o ON c.customer_id = o.customer_id
+                    WHERE o.order_id = ?
+                """, (bundle.stops[0].order_id,))
+                result = cursor.fetchone()
+                if not result:
+                    print(f"Warning: Could not find city for bundle {bundle.bundle_id[:8]}")
+                    continue
+                bundle_city = result[0]
             
-            # Filter drivers to same city as bundle
-            same_city_drivers = []
-            for idx, driver in enumerate(available_drivers):
-                driver_zone = get_zone_for_coordinates(driver[1], driver[2])
-                if driver_zone and driver_zone["city"] == bundle_zone["city"]:
-                    same_city_drivers.append((idx, driver))
+            # Filter drivers to same city (using explicit city field - more reliable)
+            same_city_drivers = [
+                (idx, driver) for idx, driver in enumerate(available_drivers)
+                if driver[4] == bundle_city  # driver[4] is the city field
+            ]
             
             if not same_city_drivers:
-                print(f"Warning: No drivers in {bundle_zone['city']} for bundle {bundle.bundle_id[:8]}")
+                print(f"Warning: No drivers in {bundle_city} for bundle {bundle.bundle_id[:8]}")
                 # Fallback to nearest driver overall
                 same_city_drivers = [(idx, driver) for idx, driver in enumerate(available_drivers)]
             
             # Find closest driver among same-city drivers
+            centroid_lat, centroid_lon = get_centroid(bundle.stops)
             best_driver_idx = None
             best_dist = float('inf')
             
             for idx, driver in same_city_drivers:
                 dist = haversine_distance(
                     centroid_lat, centroid_lon,
-                    driver[1], driver[2]
+                    driver[1], driver[2]  # driver lat, lon
                 )
                 if dist < best_dist:
                     best_dist = dist
@@ -500,8 +508,129 @@ class BundlingService:
         
         return bundles
     
+    def _update_order_timestamps(self, cursor, order_id: str, bundle_created_at: datetime,
+                                   driver_id: str | None = None):
+        """Update order with picking and delivery timestamps based on bundle creation.
+        
+        Uses distance-based delivery time calculation (haversine + driver speed +
+        traffic/weather multipliers) to maintain causal structure for ML features.
+        
+        This maintains proper chronological order:
+        created_at < confirmed_at < picked_at < picking_completed_at < delivered_at
+        
+        Args:
+            cursor: Database cursor
+            order_id: Order to update
+            bundle_created_at: When the bundle was created (used as base for timestamp calculation)
+            driver_id: Assigned driver (for speed_multiplier lookup)
+        """
+        import random
+        from datetime import timedelta
+        
+        # Get the order's confirmed_at, coordinates, and ML fields
+        cursor.execute("""
+            SELECT o.confirmed_at, o.status,
+                   s.latitude, s.longitude,
+                   o.delivery_latitude, o.delivery_longitude,
+                   o.traffic_multiplier, o.weather_condition
+            FROM orders o
+            JOIN stores s ON o.store_id = s.store_id
+            WHERE o.order_id = ?
+        """, (order_id,))
+        row = cursor.fetchone()
+        
+        if not row:
+            return
+            
+        confirmed_at_str, status = row[0], row[1]
+        store_lat, store_lon = row[2], row[3]
+        customer_lat, customer_lon = row[4], row[5]
+        traffic_mult = row[6] if row[6] else 1.0
+        weather_cond = row[7]
+        
+        if not confirmed_at_str:
+            # Order not confirmed yet, skip timestamp updates
+            return
+        
+        confirmed_at = datetime.fromisoformat(confirmed_at_str)
+        
+        # Look up driver speed multiplier
+        driver_speed_multiplier = 1.0
+        if driver_id:
+            cursor.execute(
+                "SELECT speed_multiplier FROM drivers WHERE driver_id = ?",
+                (driver_id,)
+            )
+            driver_row = cursor.fetchone()
+            if driver_row and driver_row[0] is not None:
+                driver_speed_multiplier = driver_row[0]
+        
+        # Calculate timestamps based on order status
+        picked_at = None
+        picking_completed_at = None
+        delivered_at = None
+        
+        # For picking, out_for_delivery, and delivered orders
+        if status in ['picking', 'out_for_delivery', 'delivered']:
+            # Picking started 20-90 minutes after confirmation (includes bundling wait time)
+            picked_at = confirmed_at + timedelta(minutes=random.randint(20, 90))
+        
+        # For out_for_delivery and delivered orders
+        if status in ['out_for_delivery', 'delivered']:
+            if picked_at:
+                # Picking completed 15-45 minutes after picking started (shopping time)
+                picking_completed_at = picked_at + timedelta(minutes=random.randint(15, 45))
+        
+        # For delivered orders only — use distance-based delivery time
+        if status == 'delivered':
+            if picking_completed_at:
+                if (store_lat is not None and store_lon is not None and
+                    customer_lat is not None and customer_lon is not None):
+                    # Distance-based delivery time (same formula as _generate_timestamps)
+                    distance_km = haversine_distance(store_lat, store_lon, customer_lat, customer_lon)
+                    
+                    # Transit speed: ~24 km/h ± 6 km/h (Gaussian)
+                    transit_speed = max(10.0, min(50.0, random.gauss(24.0, 6.0)))
+                    # Parking/walk time
+                    parking_walk_min = max(3.0, min(10.0, random.gauss(6.5, 1.0)))
+                    # Base delivery = distance/speed (minutes) + parking/walk
+                    base_delivery_minutes = (distance_km / transit_speed * 60.0) + parking_walk_min
+                    
+                    # Apply driver speed multiplier (slower driver → more time)
+                    base_delivery_minutes = base_delivery_minutes / driver_speed_multiplier
+                    # Apply traffic/weather multiplier
+                    base_delivery_minutes = base_delivery_minutes * traffic_mult
+                    
+                    # Gaussian variation (±10%)
+                    variation = max(0.85, min(1.15, random.gauss(1.0, 0.05)))
+                    final_delivery_minutes = max(8.0, base_delivery_minutes * variation)
+                    
+                    delivered_at = picking_completed_at + timedelta(minutes=final_delivery_minutes)
+                else:
+                    # Fallback: Gaussian delivery time (no coordinates available)
+                    fallback_min = max(10.0, min(35.0, random.gauss(20.0, 5.0)))
+                    delivered_at = picking_completed_at + timedelta(minutes=fallback_min)
+        
+        # Update the order with timestamps
+        cursor.execute("""
+            UPDATE orders
+            SET picked_at = ?,
+                picking_completed_at = ?,
+                delivered_at = ?
+            WHERE order_id = ?
+        """, (
+            picked_at.isoformat() if picked_at else None,
+            picking_completed_at.isoformat() if picking_completed_at else None,
+            delivered_at.isoformat() if delivered_at else None,
+            order_id
+        ))
+    
     def save_bundles_to_db(self, bundles: list[Bundle]):
-        """Save bundles and their assignments to database."""
+        """Save bundles and their assignments to database.
+        
+        Also updates order timestamps (picked_at, picking_completed_at, delivered_at)
+        to maintain proper chronological workflow order.
+        """
         
         with get_cursor() as cursor:
             # Insert bundles
@@ -525,13 +654,17 @@ class BundlingService:
                     bundle.centroid_lon,
                 ))
                 
-                # Insert stops with sequence
+                # Insert stops with sequence and update order timestamps
                 for seq, stop in enumerate(bundle.stops):
                     stop_id = str(uuid.uuid4())  # Generate unique ID for each stop
                     cursor.execute("""
                         INSERT INTO bundle_stops (id, bundle_id, order_id, stop_sequence)
                         VALUES (?, ?, ?, ?)
                     """, (stop_id, bundle.bundle_id, stop.order_id, seq))
+                    
+                    # Update order with workflow timestamps
+                    # This ensures proper chronological order: created_at < confirmed_at < picked_at < picking_completed_at < delivered_at
+                    self._update_order_timestamps(cursor, stop.order_id, bundle.created_at, driver_id=bundle.driver_id)
         
         print(f"Saved {len(bundles)} bundles to database")
     

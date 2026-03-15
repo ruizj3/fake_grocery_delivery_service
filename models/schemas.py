@@ -54,6 +54,8 @@ class Driver(BaseModel):
     total_deliveries: int = 0
     home_latitude: float
     home_longitude: float
+    city: str
+    state: str
     is_active: bool = True
     created_at: datetime
 
