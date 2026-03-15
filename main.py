@@ -12,7 +12,7 @@ from pathlib import Path
 # Add project root to path
 sys.path.insert(0, str(Path(__file__).parent))
 
-from db import init_database, get_table_counts, DATABASE_PATH
+from database.db import init_database, get_table_counts, DATABASE_PATH
 from generators import (
     CustomerGenerator,
     DriverGenerator,
@@ -20,22 +20,45 @@ from generators import (
     StoreGenerator,
     OrderGenerator,
 )
+from generators.base import set_simulation_config
+from simulation import SimulationConfig
 from services import run_bundling_analysis
 
 
-def generate_data(num_orders: int, seed: int = 42):
-    """Generate all data based on target order count"""
+def generate_data(num_orders: int, seed: int = 42, days_back: int = 90, 
+                  sim_config: SimulationConfig | None = None):
+    """Generate all data based on target order count.
     
-    # Scale other entities relative to orders
-    num_customers = max(100, num_orders // 5)   # ~5 orders per customer avg
-    num_drivers = max(20, num_orders // 50)     # ~50 orders per driver avg
-    num_stores = max(12, num_orders // 80)      # ~80 orders per store avg (2 per city min)
+    Args:
+        num_orders: Number of orders to generate.
+        seed: Random seed for reproducibility.
+        days_back: Number of days of historical data to generate.
+        sim_config: Optional SimulationConfig for deterministic simulation.
+                   When provided, uses proper statistical distributions
+                   (Gaussian, Poisson) and seeded RNG throughout.
+    """
     
-    print(f"\n📊 Generating data for {num_orders} orders...")
+    # Apply simulation config globally if provided
+    if sim_config is None:
+        sim_config = SimulationConfig(master_seed=seed)
+    set_simulation_config(sim_config)
+    
+    # Scale other entities relative to orders for realistic ratios
+    # Increased by 50% for customers and drivers
+    num_customers = max(150, int(num_orders // 5 * 1.5))   # ~3.3 orders per customer avg (50% more customers)
+    num_drivers = max(30, int(num_orders // 50 * 1.5))     # ~33 orders per driver avg (50% more drivers)
+    num_stores = min(100, max(12, num_orders // 10000))     # Cap stores at 100
+    
+    det_label = " [DETERMINISTIC]" if sim_config.deterministic_mode else ""
+    print(f"\n📊 Generating data for {num_orders} orders...{det_label}")
     print(f"   - {num_customers} customers")
     print(f"   - {num_drivers} drivers")
     print(f"   - {num_stores} store locations (spread across 6 cities)")
-    print(f"   - Full product catalog\n")
+    print(f"   - Full product catalog")
+    print(f"   - Date range: last {days_back} days")
+    if sim_config.deterministic_mode:
+        print(f"   - Master seed: {sim_config.master_seed}")
+    print()
     
     # Generate customers
     print("👥 Generating customers...")
@@ -74,7 +97,7 @@ def generate_data(num_orders: int, seed: int = 42):
     
     # Generate orders (this ties everything together)
     print("📝 Generating orders...")
-    order_gen = OrderGenerator(seed)
+    order_gen = OrderGenerator(seed, days_back_max=days_back)
     orders, order_items = order_gen.generate_batch(num_orders)
     order_gen.save_to_db((orders, order_items))
     
@@ -141,9 +164,15 @@ Examples:
   python main.py                    # Generate 500 orders (default)
   python main.py --orders 5000      # Generate 5000 orders
   python main.py --reset --orders 1000  # Reset DB and generate fresh
+  python main.py --reset --orders 1200000 --days 60  # 1.2M orders over 60 days
   python main.py --bundle           # Run bundling analysis
   python main.py --export           # Export tables to CSV
   python main.py --stats            # Show database statistics
+
+Deterministic Simulation:
+  python main.py --deterministic --seed 42   # Reproducible output (same every run)
+  python main.py --deterministic --seed 42 --error-rate 0.05  # 5% simulated errors
+  python main.py --deterministic --order-rate 10  # ~10 orders/min Poisson arrival
         """
     )
     
@@ -168,6 +197,13 @@ Examples:
     )
     
     parser.add_argument(
+        "--days", "-d",
+        type=int,
+        default=90,
+        help="Number of days back for historical data (default: 90)"
+    )
+    
+    parser.add_argument(
         "--export", "-e",
         action="store_true",
         help="Export all tables to CSV files"
@@ -183,6 +219,26 @@ Examples:
         "--bundle",
         action="store_true",
         help="Run bundling analysis on existing orders"
+    )
+    
+    parser.add_argument(
+        "--deterministic",
+        action="store_true",
+        help="Enable deterministic simulation mode (same seed = same output)"
+    )
+    
+    parser.add_argument(
+        "--error-rate",
+        type=float,
+        default=0.0,
+        help="Simulated error injection rate (0.0-1.0, default: 0.0)"
+    )
+    
+    parser.add_argument(
+        "--order-rate",
+        type=float,
+        default=6.0,
+        help="Order arrival rate per minute for Poisson process (default: 6.0)"
     )
     
     args = parser.parse_args()
@@ -203,7 +259,18 @@ Examples:
         return
     
     # Generate data
-    generate_data(num_orders=args.orders, seed=args.seed)
+    sim_config = SimulationConfig(
+        master_seed=args.seed,
+        deterministic_mode=args.deterministic,
+        api_error_rate=args.error_rate,
+        order_arrival_rate_per_min=args.order_rate,
+    )
+    generate_data(
+        num_orders=args.orders, 
+        seed=args.seed, 
+        days_back=args.days,
+        sim_config=sim_config,
+    )
     
     # Show final stats
     show_stats()

@@ -7,7 +7,7 @@ import sqlite3
 import pandas as pd
 from pathlib import Path
 
-DATABASE_PATH = Path(__file__).parent / "database" / "grocery_delivery.db"
+DATABASE_PATH = Path(__file__).parent.parent / "database" / "grocery_delivery.db"
 
 
 def main():

@@ -5,7 +5,7 @@ from datetime import datetime, timedelta
 from dataclasses import dataclass
 from .base import BaseGenerator
 from .geofence import get_all_zones, get_zone_weights
-from db import get_cursor
+from database.db import get_cursor
 
 
 @dataclass
@@ -115,7 +115,48 @@ class StoreGenerator(BaseGenerator):
         )
     
     def generate_batch(self, count: int) -> list[Store]:
-        return [self.generate_one() for _ in range(count)]
+        """Generate stores, ensuring at least one per city if count >= number of cities."""
+        stores = []
+        
+        # If we have enough stores, ensure at least one per city
+        if count >= len(self.delivery_zones):
+            # Generate one store for each city first
+            for zone in self.delivery_zones:
+                # Temporarily force the zone selection
+                original_zone = zone
+                r = zone["radius_km"] * 0.6 * math.sqrt(random.random())
+                theta = random.uniform(0, 2 * math.pi)
+                lat_offset = (r * math.cos(theta)) / 111.0
+                lon_offset = (r * math.sin(theta)) / (111.0 * math.cos(math.radians(zone["lat"])))
+                lat = zone["lat"] + lat_offset
+                lon = zone["lon"] + lon_offset
+                opens, closes = random.choice(self.OPERATING_HOURS)
+                days_ago = random.randint(30, 1825)
+                created_at = datetime.now() - timedelta(days=days_ago)
+                
+                stores.append(Store(
+                    store_id=str(uuid.uuid4()),
+                    name=self._generate_unique_name(),
+                    address=self._generate_address(),
+                    city=zone["city"],
+                    state=zone["state"],
+                    zip_code=self.fake.zipcode_in_state(zone["state"]),
+                    latitude=lat,
+                    longitude=lon,
+                    opens_at=opens,
+                    closes_at=closes,
+                    is_active=random.random() < 0.95,
+                    created_at=created_at,
+                ))
+            
+            # Generate remaining stores randomly
+            remaining = count - len(self.delivery_zones)
+            stores.extend([self.generate_one() for _ in range(remaining)])
+        else:
+            # Not enough stores to guarantee one per city, generate randomly
+            stores = [self.generate_one() for _ in range(count)]
+        
+        return stores
     
     def save_to_db(self, records: list[Store]):
         with get_cursor() as cursor:
