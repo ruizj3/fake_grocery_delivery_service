@@ -12,7 +12,7 @@ from pathlib import Path
 # Add project root to path
 sys.path.insert(0, str(Path(__file__).parent))
 
-from database.db import init_database, get_table_counts, DATABASE_PATH
+from database.db import init_database, get_table_counts, DATABASE_PATH, get_connection, table_exists
 from generators import (
     CustomerGenerator,
     DriverGenerator,
@@ -106,13 +106,12 @@ def generate_data(num_orders: int, seed: int = 42, days_back: int = 90,
 
 def export_to_csv():
     """Export all tables to CSV files"""
-    import sqlite3
     import pandas as pd
     
     export_dir = Path(__file__).parent / "exports"
     export_dir.mkdir(exist_ok=True)
     
-    conn = sqlite3.connect(DATABASE_PATH)
+    conn = get_connection()
     
     # Core tables
     tables = [
@@ -126,9 +125,7 @@ def export_to_csv():
     ]
     
     # Check for bundle tables
-    cursor = conn.cursor()
-    cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='bundles'")
-    if cursor.fetchone():
+    if table_exists("bundles"):
         tables.extend(["bundles", "bundle_stops"])
     
     print("\n📁 Exporting to CSV...")
