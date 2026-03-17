@@ -18,3 +18,5 @@ services:
           property: connectionString
       - key: PYTHON_VERSION
         value: "3.13.0"
+      - key: PYTHONPATH
+        value: /opt/render/project/src
