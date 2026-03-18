@@ -28,7 +28,8 @@ def get_date_range(conn):
     min_date, max_date = cursor.fetchone()
     if not min_date:
         return None, None
-    return datetime.fromisoformat(min_date), datetime.fromisoformat(max_date)
+    return (min_date if isinstance(min_date, datetime) else datetime.fromisoformat(min_date),
+            max_date if isinstance(max_date, datetime) else datetime.fromisoformat(max_date))
 
 
 def count_orders_to_bundle(conn, skip_delivered=False):

@@ -342,7 +342,10 @@ async def delivery_simulator():
                         for order_id, sequence, picking_completed_at in stops:
                             # Each stop gets delivered at incremental times
                             from datetime import timedelta
-                            completed_dt = datetime.fromisoformat(picking_completed_at) if picking_completed_at else datetime.now()
+                            if picking_completed_at:
+                                completed_dt = picking_completed_at if isinstance(picking_completed_at, datetime) else datetime.fromisoformat(picking_completed_at)
+                            else:
+                                completed_dt = datetime.now()
                             # Base delay (20 min to start delivery) + sequence-based increments
                             delivery_delay = timedelta(minutes=20 + (sequence * time_per_stop))
                             delivered_at = completed_dt + delivery_delay
