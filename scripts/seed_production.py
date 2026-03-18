@@ -21,6 +21,7 @@ def main():
     parser.add_argument("--seed", type=int, default=42, help="Random seed for deterministic mode")
     parser.add_argument("--customers", type=int, default=200, help="Extra customers to generate")
     parser.add_argument("--drivers", type=int, default=40, help="Extra drivers to generate")
+    parser.add_argument("--stores", type=int, default=15, help="Number of stores to generate")
     args = parser.parse_args()
 
     base = args.url.rstrip("/")
@@ -55,7 +56,36 @@ def main():
     checked(r)
     print(f"  Done: {r.json()}")
 
-    # 3. Generate extra customers
+    # 3. Check what already exists
+    print("\nChecking existing data...")
+    r = client.get("/stats")
+    checked(r)
+    stats = r.json()
+    for table, count in stats.items():
+        if count > 0:
+            print(f"  {table}: {count}")
+
+    # 4. Generate parent product catalog (needed for store inventory → order items)
+    if stats.get("parent_products", 0) == 0:
+        print("\nGenerating parent product catalog...")
+        r = client.post("/products/generate-catalog")
+        checked(r)
+        data = r.json()
+        print(f"  Created {data.get('count', '?')} parent products")
+    else:
+        print(f"\nParent products already exist ({stats['parent_products']}), skipping catalog generation")
+
+    # 5. Generate stores (each store gets inventory from parent products → store_products)
+    if stats.get("stores", 0) == 0:
+        print(f"\nGenerating {args.stores} stores with inventory...")
+        r = client.post(f"/stores/generate?count={args.stores}")
+        checked(r)
+        data = r.json()
+        print(f"  Created {data.get('count', args.stores)} stores (each with store_products inventory)")
+    else:
+        print(f"\nStores already exist ({stats['stores']}), skipping store generation")
+
+    # 6. Generate customers
     print(f"\nGenerating {args.customers} customers...")
     remaining = args.customers
     while remaining > 0:
@@ -66,7 +96,7 @@ def main():
         print(f"  Created {data.get('count', count)} customers")
         remaining -= count
 
-    # 4. Generate extra drivers
+    # 7. Generate drivers
     print(f"\nGenerating {args.drivers} drivers...")
     remaining = args.drivers
     while remaining > 0:
@@ -77,7 +107,17 @@ def main():
         print(f"  Created {data.get('count', count)} drivers")
         remaining -= count
 
-    # 5. Generate orders in batches
+    # 8. Verify store_products exist before generating orders
+    r = client.get("/stats")
+    checked(r)
+    stats = r.json()
+    if stats.get("store_products", 0) == 0:
+        print("\nERROR: No store_products found. Orders need store inventory to create items.")
+        print("  Try regenerating the catalog: POST /products/generate-catalog")
+        sys.exit(1)
+    print(f"\nReady to generate orders ({stats['store_products']} store products available)")
+
+    # 9. Generate orders in batches
     total_orders = 0
     total_items = 0
     num_batches = (args.orders + batch_size - 1) // batch_size
@@ -97,14 +137,14 @@ def main():
 
     print(f"\n  Total: {total_orders} orders, {total_items} items")
 
-    # 6. Bundle all orders
+    # 10. Bundle all orders
     print("\nProcessing bundles...")
     r = client.post("/bundles/process")
     checked(r)
     data = r.json()
     print(f"  Bundles created: {data}")
 
-    # 7. Final stats
+    # 11. Final stats
     print("\nFinal database stats:")
     r = client.get("/stats")
     checked(r)
