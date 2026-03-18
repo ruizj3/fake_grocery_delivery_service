@@ -82,6 +82,18 @@ class _PgCursorWrapper:
         sql = self._add_conflict_clause(sql, original)
         return self._cursor.executemany(sql, seq_of_params)
 
+    def savepoint(self, name="sp"):
+        """Create a savepoint (PostgreSQL transaction recovery)."""
+        self._cursor.execute(f"SAVEPOINT {name}")
+
+    def rollback_to(self, name="sp"):
+        """Rollback to a savepoint (PostgreSQL transaction recovery)."""
+        self._cursor.execute(f"ROLLBACK TO SAVEPOINT {name}")
+
+    def release_savepoint(self, name="sp"):
+        """Release a savepoint."""
+        self._cursor.execute(f"RELEASE SAVEPOINT {name}")
+
     def fetchone(self):
         row = self._cursor.fetchone()
         if row is None:

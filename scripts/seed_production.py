@@ -1,0 +1,119 @@
+#!/usr/bin/env python3
+"""
+Seed a production database via the API.
+
+Usage:
+    python scripts/seed_production.py --url https://YOUR-APP.onrender.com --key YOUR_API_KEY
+    python scripts/seed_production.py --url https://YOUR-APP.onrender.com --key YOUR_API_KEY --orders 5000
+"""
+
+import argparse
+import httpx
+import sys
+import time
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Seed production database via API")
+    parser.add_argument("--url", required=True, help="Base URL of the API")
+    parser.add_argument("--key", required=True, help="API key (X-API-Key)")
+    parser.add_argument("--orders", type=int, default=1000, help="Number of orders to generate")
+    parser.add_argument("--seed", type=int, default=42, help="Random seed for deterministic mode")
+    parser.add_argument("--customers", type=int, default=200, help="Extra customers to generate")
+    parser.add_argument("--drivers", type=int, default=40, help="Extra drivers to generate")
+    args = parser.parse_args()
+
+    base = args.url.rstrip("/")
+    headers = {"X-API-Key": args.key, "Content-Type": "application/json"}
+    batch_size = 100
+
+    client = httpx.Client(base_url=base, headers=headers, timeout=120)
+
+    def checked(r):
+        """Raise with response body on error."""
+        if r.status_code >= 400:
+            print(f"  ERROR {r.status_code}: {r.text}")
+            r.raise_for_status()
+        return r
+
+    # 1. Health check
+    print("Checking API health...")
+    try:
+        r = client.get("/")
+        r.raise_for_status()
+        print(f"  API is up: {r.json()}")
+    except Exception as e:
+        print(f"  ERROR: Cannot reach API: {e}")
+        sys.exit(1)
+
+    # 2. Set deterministic seed
+    print(f"\nSetting deterministic seed={args.seed}...")
+    r = client.patch("/simulation/config", json={
+        "master_seed": args.seed,
+        "deterministic_mode": True,
+    })
+    checked(r)
+    print(f"  Done: {r.json()}")
+
+    # 3. Generate extra customers
+    print(f"\nGenerating {args.customers} customers...")
+    remaining = args.customers
+    while remaining > 0:
+        count = min(remaining, 100)
+        r = client.post(f"/customers/generate?count={count}")
+        checked(r)
+        data = r.json()
+        print(f"  Created {data.get('count', count)} customers")
+        remaining -= count
+
+    # 4. Generate extra drivers
+    print(f"\nGenerating {args.drivers} drivers...")
+    remaining = args.drivers
+    while remaining > 0:
+        count = min(remaining, 100)
+        r = client.post(f"/drivers/generate?count={count}")
+        checked(r)
+        data = r.json()
+        print(f"  Created {data.get('count', count)} drivers")
+        remaining -= count
+
+    # 5. Generate orders in batches
+    total_orders = 0
+    total_items = 0
+    num_batches = (args.orders + batch_size - 1) // batch_size
+    print(f"\nGenerating {args.orders} orders in {num_batches} batches...")
+    start = time.time()
+
+    for i in range(num_batches):
+        count = min(batch_size, args.orders - total_orders)
+        r = client.post(f"/orders/generate-batch?count={count}")
+        checked(r)
+        data = r.json()
+        total_orders += data["count"]
+        total_items += data["total_items"]
+        elapsed = time.time() - start
+        print(f"  Batch {i + 1}/{num_batches}: {data['count']} orders, "
+              f"{data['total_items']} items ({elapsed:.1f}s elapsed)")
+
+    print(f"\n  Total: {total_orders} orders, {total_items} items")
+
+    # 6. Bundle all orders
+    print("\nProcessing bundles...")
+    r = client.post("/bundles/process")
+    checked(r)
+    data = r.json()
+    print(f"  Bundles created: {data}")
+
+    # 7. Final stats
+    print("\nFinal database stats:")
+    r = client.get("/stats")
+    checked(r)
+    stats = r.json()
+    for table, count in stats.items():
+        print(f"  {table:20s} {count:>8,}")
+
+    print("\nDone!")
+
+
+if __name__ == "__main__":
+    main()
