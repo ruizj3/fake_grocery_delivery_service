@@ -7,10 +7,12 @@ Live data generation service with:
 - Periodic bundle processing
 """
 
-from fastapi import FastAPI, BackgroundTasks, HTTPException, Query
+from fastapi import FastAPI, BackgroundTasks, HTTPException, Query, Depends, Security
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import APIKeyHeader
 from contextlib import asynccontextmanager
 import asyncio
+import os
 import random
 from datetime import datetime
 
@@ -36,6 +38,23 @@ from api.models import (
     PredictionResponse,
     SimulationConfigUpdate,
 )
+
+
+# =============================================================================
+# API Key Authentication
+# =============================================================================
+
+API_KEY = os.environ.get("API_KEY")
+_api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
+
+
+async def require_api_key(api_key: str = Security(_api_key_header)):
+    """Dependency that protects write endpoints with an API key.
+    If API_KEY is not set, all requests are allowed (local dev)."""
+    if API_KEY is None:
+        return  # No key configured — skip auth (local development)
+    if api_key != API_KEY:
+        raise HTTPException(status_code=403, detail="Invalid or missing API key")
 
 
 # Global state for background tasks
@@ -618,6 +637,17 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.middleware("http")
+async def api_key_middleware(request, call_next):
+    """Require API key for all non-GET requests when API_KEY is set."""
+    if API_KEY and request.method != "GET":
+        key = request.headers.get("X-API-Key")
+        if key != API_KEY:
+            from starlette.responses import JSONResponse
+            return JSONResponse(status_code=403, content={"detail": "Invalid or missing API key"})
+    return await call_next(request)
 
 
 # =============================================================================
