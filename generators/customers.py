@@ -78,6 +78,8 @@ class CustomerGenerator(BaseGenerator):
     
     def save_to_db(self, records: list[Customer]):
         import sqlite3
+        from database.db import _is_postgres
+        use_savepoints = _is_postgres()
         saved_count = 0
         with get_cursor() as cursor:
             for c in records:
@@ -92,6 +94,8 @@ class CustomerGenerator(BaseGenerator):
                 
                 for attempt in range(max_retries):
                     try:
+                        if use_savepoints:
+                            cursor.savepoint("cust_insert")
                         cursor.execute(
                             """
                             INSERT INTO customers 
@@ -105,11 +109,18 @@ class CustomerGenerator(BaseGenerator):
                              c.created_at.isoformat(), c.is_premium,
                              persona, preferred_hour, routine_strength)
                         )
+                        if use_savepoints:
+                            cursor.release_savepoint("cust_insert")
                         saved_count += 1
                         break
-                    except sqlite3.IntegrityError:
-                        # Email conflict - append random suffix
-                        email = f"{c.email.split('@')[0]}{random.randint(1,9999)}@{c.email.split('@')[1]}"
+                    except (sqlite3.IntegrityError, Exception) as e:
+                        if "IntegrityError" in type(e).__name__ or "duplicate key" in str(e).lower() or "unique constraint" in str(e).lower():
+                            if use_savepoints:
+                                cursor.rollback_to("cust_insert")
+                            # Email conflict - append random suffix
+                            email = f"{c.email.split('@')[0]}{random.randint(1,9999)}@{c.email.split('@')[1]}"
+                        else:
+                            raise
         print(f"Saved {saved_count} customers with personas")
     
     def get_all_ids(self) -> list[str]:

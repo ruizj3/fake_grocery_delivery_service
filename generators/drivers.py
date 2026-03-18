@@ -107,6 +107,8 @@ class DriverGenerator(BaseGenerator):
     
     def save_to_db(self, records: list[Driver]):
         import sqlite3
+        from database.db import _is_postgres
+        use_savepoints = _is_postgres()
         saved_count = 0
         with get_cursor() as cursor:
             for d in records:
@@ -133,6 +135,8 @@ class DriverGenerator(BaseGenerator):
                 
                 for attempt in range(max_retries):
                     try:
+                        if use_savepoints:
+                            cursor.savepoint("drv_insert")
                         cursor.execute(
                             """
                             INSERT INTO drivers 
@@ -147,11 +151,18 @@ class DriverGenerator(BaseGenerator):
                              d.home_latitude, d.home_longitude, d.city, d.state, d.is_active, d.created_at.isoformat(),
                              speed_multiplier, reliability, experience_level)
                         )
+                        if use_savepoints:
+                            cursor.release_savepoint("drv_insert")
                         saved_count += 1
                         break
-                    except sqlite3.IntegrityError:
-                        # Email conflict - append random suffix
-                        email = f"{d.email.split('@')[0]}{random.randint(1,9999)}@{d.email.split('@')[1]}"
+                    except (sqlite3.IntegrityError, Exception) as e:
+                        if "IntegrityError" in type(e).__name__ or "duplicate key" in str(e).lower() or "unique constraint" in str(e).lower():
+                            if use_savepoints:
+                                cursor.rollback_to("drv_insert")
+                            # Email conflict - append random suffix
+                            email = f"{d.email.split('@')[0]}{random.randint(1,9999)}@{d.email.split('@')[1]}"
+                        else:
+                            raise
         print(f"Saved {saved_count} drivers with performance profiles")
     
     def get_active_ids(self) -> list[str]:
