@@ -66,6 +66,8 @@ class _PgCursorWrapper:
         """Add ON CONFLICT clause for INSERT OR IGNORE/REPLACE translations."""
         if re.search(r"INSERT\s+OR\s+IGNORE", original_sql, re.IGNORECASE):
             sql = sql.rstrip().rstrip(";") + " ON CONFLICT DO NOTHING"
+        elif re.search(r"INSERT\s+OR\s+REPLACE", original_sql, re.IGNORECASE):
+            sql = sql.rstrip().rstrip(";") + " ON CONFLICT DO NOTHING"
         return sql
 
     def execute(self, sql, params=None):
