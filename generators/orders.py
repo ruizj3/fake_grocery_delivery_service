@@ -774,7 +774,7 @@ class OrderGenerator(BaseGenerator):
             last_order_date = cursor.fetchone()[0]
             
             if last_order_date:
-                last_dt = datetime.fromisoformat(last_order_date)
+                last_dt = last_order_date if isinstance(last_order_date, datetime) else datetime.fromisoformat(last_order_date)
                 days_since_last = (created_at - last_dt).days
             else:
                 days_since_last = None
@@ -1014,7 +1014,7 @@ class OrderGenerator(BaseGenerator):
                     """, (customer_id, order_id))
                     last_order_date = cursor.fetchone()[0]
                     if last_order_date:
-                        last_dt = datetime.fromisoformat(last_order_date)
+                        last_dt = last_order_date if isinstance(last_order_date, datetime) else datetime.fromisoformat(last_order_date)
                         days_since_last = (created_at - last_dt).days
                     else:
                         days_since_last = None

@@ -245,7 +245,7 @@ class BundlingService:
                 store_id=row[1],
                 latitude=row[2],
                 longitude=row[3],
-                created_at=datetime.fromisoformat(row[4]),
+                created_at=row[4] if isinstance(row[4], datetime) else datetime.fromisoformat(row[4]),
                 customer_id=row[5],
                 total=row[6],
             )
@@ -273,7 +273,7 @@ class BundlingService:
                 store_id=row[1],
                 latitude=row[2],
                 longitude=row[3],
-                created_at=datetime.fromisoformat(row[4]),
+                created_at=row[4] if isinstance(row[4], datetime) else datetime.fromisoformat(row[4]),
                 customer_id=row[5],
                 total=row[6],
             )
@@ -552,7 +552,7 @@ class BundlingService:
             # Order not confirmed yet, skip timestamp updates
             return
         
-        confirmed_at = datetime.fromisoformat(confirmed_at_str)
+        confirmed_at = confirmed_at_str if isinstance(confirmed_at_str, datetime) else datetime.fromisoformat(confirmed_at_str)
         
         # Look up driver speed multiplier
         driver_speed_multiplier = 1.0
