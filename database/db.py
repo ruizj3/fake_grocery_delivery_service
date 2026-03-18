@@ -30,6 +30,13 @@ class _PgCursorWrapper:
     def __init__(self, cursor):
         self._cursor = cursor
 
+    # Known boolean columns used with integer comparisons in SQLite
+    _BOOL_COLUMNS = re.compile(
+        r"\b(is_active|is_available|is_on_sale|is_organic|is_premium|"
+        r"is_peak_hour|is_weekend|prediction_sent|prediction_failed)\s*=\s*([01])\b",
+        re.IGNORECASE,
+    )
+
     @staticmethod
     def _translate_sql(sql: str) -> str:
         # Replace ? with %s, but skip ?? and strings
@@ -48,6 +55,10 @@ class _PgCursorWrapper:
                 sql,
                 flags=re.IGNORECASE,
             )
+        # SQLite boolean comparisons: is_col = 1 → is_col = TRUE
+        def _bool_replace(m):
+            return f"{m.group(1)} = {'TRUE' if m.group(2) == '1' else 'FALSE'}"
+        sql = _PgCursorWrapper._BOOL_COLUMNS.sub(_bool_replace, sql)
         return sql
 
     @staticmethod
