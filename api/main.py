@@ -1601,9 +1601,17 @@ async def reset_database(confirm: bool = Query(default=False)):
     
     init_database(reset=True)
     
-    # Regenerate base data
+    # Regenerate base data (mirrors lifespan startup)
     products = state.product_gen.generate_catalog()
     state.product_gen.save_to_db(products)
+    
+    stores = state.store_gen.generate_batch(15)
+    state.store_gen.save_to_db(stores)
+    
+    store_ids = state.store_gen.get_all_ids()
+    for store_id in store_ids:
+        inventory = state.product_gen.generate_store_inventory(store_id)
+        state.product_gen.save_store_products_to_db(inventory)
     
     customers = state.customer_gen.generate_batch(50)
     state.customer_gen.save_to_db(customers)

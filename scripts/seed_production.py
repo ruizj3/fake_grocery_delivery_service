@@ -22,6 +22,7 @@ def main():
     parser.add_argument("--customers", type=int, default=200, help="Extra customers to generate")
     parser.add_argument("--drivers", type=int, default=40, help="Extra drivers to generate")
     parser.add_argument("--stores", type=int, default=15, help="Number of stores to generate")
+    parser.add_argument("--no-reset", action="store_true", help="Skip database reset")
     args = parser.parse_args()
 
     base = args.url.rstrip("/")
@@ -47,11 +48,30 @@ def main():
         print(f"  ERROR: Cannot reach API: {e}")
         sys.exit(1)
 
-    # 2. Set deterministic seed
-    print(f"\nSetting deterministic seed={args.seed}...")
+    # 2. Reset database (drops all tables, recreates with base data)
+    if not args.no_reset:
+        print("\nResetting database...")
+        r = client.post("/admin/reset?confirm=true")
+        checked(r)
+        data = r.json()
+        print(f"  Reset complete: {data.get('stats', {})}")
+    else:
+        print("\nSkipping reset (--no-reset)")
+
+    # 3. Set deterministic seed + fast arrival rates for bulk seeding
+    print(f"\nSetting deterministic seed={args.seed} with 50x arrival rates...")
     r = client.patch("/simulation/config", json={
         "master_seed": args.seed,
         "deterministic_mode": True,
+        "order_arrival_rate_per_min": 300.0,
+        "customer_arrival_rate_per_min": 25.0,
+        "driver_arrival_rate_per_min": 10.0,
+        "confirmation_delay_mean_sec": 2.4,
+        "confirmation_delay_std_sec": 0.9,
+        "picking_duration_mean_min": 0.3,
+        "picking_duration_std_min": 0.1,
+        "transit_speed_mean_kmh": 1200.0,
+        "transit_speed_std_kmh": 300.0,
     })
     checked(r)
     print(f"  Done: {r.json()}")
